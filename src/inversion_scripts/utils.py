@@ -792,6 +792,15 @@ def get_strdate(current_time, date_threshold):
 
     return strdate
 
+def get_local_date(time_str, lon):
+    """
+    Convert UTC YYYYMMDD_HH string to local solar date.
+    """
+    utc_dt = pd.to_datetime(time_str, format="%Y%m%d_%H")
+
+    local_dt = utc_dt + pd.Timedelta(hours=float(lon) / 15.0)
+
+    return local_dt.strftime("%Y%m%d")
 
 def filter_prior_files(filenames, start_date, end_date):
     """
@@ -926,3 +935,101 @@ def update_prior_error_for_OptimizeSoil(prior_ds, org_prior_error, StateVectorFi
             prior_err[i - 1] = np.sqrt((org_prior_error * emisi) ** 2 +
                                        (org_prior_error * soili) ** 2) / fluxi
     return prior_err
+
+import numpy as np
+
+
+def build_pert_simulations_dict(
+    config,
+    n_elements,
+):
+    """
+    Build a dictionary mapping perturbation simulation numbers
+    (zero-padded run directory names) to lists of state vector elements.
+
+    Parameters
+    ----------
+    config : dict
+        IMI configuration dictionary containing:
+            - OptimizeOH
+            - OptimizeBCs
+            - isRegional
+            - NumJacobianTracers
+    n_elements : int
+        Total number of state vector elements.
+    
+    Returns
+    -------
+    dict
+        Dictionary where keys are zero-padded run numbers (e.g. '0001')
+        and values are lists of associated state vector elements.
+    """
+
+    # Extract config settings
+    opt_OH = config["OptimizeOH"]
+    opt_BC = config["OptimizeBCs"]
+    is_Regional = config["isRegional"]
+    ntracers = config["NumJacobianTracers"]
+
+    # Number of OH and BC elements
+    num_BC = 4
+    num_OH = 1 if is_Regional else 2
+
+    # Number of base emissions runs
+    n_base_runs = (
+        n_elements
+        - int(opt_OH) * num_OH
+        - int(opt_BC) * num_BC
+    ) / ntracers
+
+    # Total number of runs including OH and BC
+    nruns = (
+        int(np.ceil(n_base_runs))
+        + int(opt_OH) * num_OH
+        + int(opt_BC) * num_BC
+    )
+
+    # Dictionary mapping run number -> state vector elements
+    pert_simulations_dict = {}
+
+    for e in range(n_elements):
+        # State vector elements are numbered 1..n_elements
+        sv_elem = e + 1
+
+        is_OH_element = check_is_OH_element(
+            sv_elem, n_elements, opt_OH, is_Regional
+        )
+
+        is_BC_element = check_is_BC_element(
+            sv_elem,
+            n_elements,
+            opt_OH,
+            opt_BC,
+            is_OH_element,
+            is_Regional,
+        )
+
+        # Determine which run directory to look in
+        if is_OH_element:
+            if is_Regional:
+                run_number = nruns
+            else:
+                num_back = n_elements % sv_elem
+                run_number = nruns - num_back
+
+        elif is_BC_element:
+            num_back = n_elements % sv_elem
+            run_number = nruns - num_back
+
+        else:
+            run_number = int(np.ceil(sv_elem / ntracers))
+
+        run_num = str(run_number).zfill(4)
+
+        # Add element to dictionary
+        if run_num not in pert_simulations_dict:
+            pert_simulations_dict[run_num] = [sv_elem]
+        else:
+            pert_simulations_dict[run_num].append(sv_elem)
+
+    return pert_simulations_dict

@@ -373,7 +373,7 @@ def remapping_weights(p_sat_edges, p_gc_edges):
     with np.errstate(invalid="ignore", divide="ignore"):
         W = np.where(denom > 0, overlap / denom, 0.0)
         
-    return W
+    return W # (N, S, G)
 
 def nearest_loc(query_location, reference_grid, tolerance=0.5):
     """Find the index of the nearest grid location to a query location, with some tolerance."""

@@ -27,11 +27,12 @@ time_diff() {
 
 print_stats() {
     printf "\nRuntime statistics (s):"
-    printf "\n Setup      : %s" "$(time_diff "${setup_start-}"     "${setup_end-}")"
-    printf "\n Spinup     : %s" "$(time_diff "${spinup_start-}"    "${spinup_end-}")"
-    printf "\n Jacobian   : %s" "$(time_diff "${jacobian_start-}"  "${jacobian_end-}")"
-    printf "\n Inversion  : %s" "$(time_diff "${inversion_start-}" "${inversion_end-}")"
-    printf "\n Posterior  : %s\n\n" "$(time_diff "${posterior_start-}" "${posterior_end-}")"
+    printf "\n Setup        : %s" "$(time_diff "${setup_start-}"     "${setup_end-}")"
+    printf "\n Spinup       : %s" "$(time_diff "${spinup_start-}"    "${spinup_end-}")"
+    printf "\n Jacobian     : %s" "$(time_diff "${jacobian_start-}"  "${jacobian_end-}")"
+    printf "\n OverpassDiag : %s" "$(time_diff "${overpass_start-}" "${overpass_end-}")"
+    printf "\n Inversion    : %s" "$(time_diff "${inversion_start-}" "${inversion_end-}")"
+    printf "\n Posterior    : %s\n\n" "$(time_diff "${posterior_start-}" "${posterior_end-}")"
 }
 
 # Description: Print error message with full stack trace for if the IMI fails
@@ -265,7 +266,7 @@ regrid_tropomi-BC-restart_gcc2gchp() {
             local regridding_method="conserve"
             ESMF_RegridWeightGen -s "$src_grid" -d "$dst_grid" -m "$regridding_method" -w "$regrid_weights_ch4" > /dev/null 2>&1
         fi
-	    conda activate $CondaEnv
+	    # conda activate $CondaEnv
         python -m gcpy.regrid_restart_file            \
 	       --stretched-grid                       \
 	       --stretch-factor "$STRETCH_FACTOR"     \
@@ -274,7 +275,7 @@ regrid_tropomi-BC-restart_gcc2gchp() {
 	       "$tropomi_bc"                          \
 	       "$regrid_weights_ch4"                  \
 	       "$template" > /dev/null 2>&1
-	    source "$GEOSChemEnv"
+	    # source "$GEOSChemEnv"
         mv new_restart_file.nc "$restart_ch4"
     else
         if [ ! -f "$dst_grid" ]; then
@@ -285,12 +286,12 @@ regrid_tropomi-BC-restart_gcc2gchp() {
             local regridding_method="conserve"
             ESMF_RegridWeightGen -s "$src_grid" -d "$dst_grid" -m "$regridding_method" -w "$regrid_weights_ch4" > /dev/null 2>&1
         fi
-        conda activate $CondaEnv
+        # conda activate $CondaEnv
         python -m gcpy.regrid_restart_file            \
                "$tropomi_bc"                          \
                "$regrid_weights_ch4"                  \
                "$template" > /dev/null 2>&1
-        source "$GEOSChemEnv"
+        # source "$GEOSChemEnv"
         mv new_restart_file.nc "$restart_ch4"
     fi
 

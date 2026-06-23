@@ -133,8 +133,8 @@ fi
 InversionPath=$(pwd -P)
 ConfigPath=${InversionPath}/${ConfigFile}
 
-# add inversion path to python path
-export PYTHONPATH=${PYTHONPATH}:${InversionPath}
+# prepend inversion path to python path
+export PYTHONPATH=${InversionPath}:${PYTHONPATH}
 
 # Make run directory
 mkdir -p -v ${RunDirs}
@@ -219,6 +219,13 @@ fi
 ##=======================================================================
 if ("$DoJacobian" && ! "$KalmanMode"); then
     run_jacobian
+fi
+
+##=======================================================================
+##  Calculate diagnostics at satellite overpass time
+##=======================================================================
+if ("$DoSatelliteDiagnostics" && ! "$KalmanMode"); then
+    calculate_overpass_diagnostics
 fi
 
 ##=======================================================================

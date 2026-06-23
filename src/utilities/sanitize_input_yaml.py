@@ -85,6 +85,7 @@ config_required = [
     "MakePeriodsCSV",
     "UseWaterObs",
     "OptimizeSoil",
+    "SatelliteDiagnostics",
 ]
 
 # dict of variables that are required if another variable is set to true
@@ -128,6 +129,13 @@ conditional_dict["STRETCH_GRID"] = [
     "TARGET_LON"
 ]
 conditional_dict["RegridStateVector"] = ["ReferenceSVTileGridDir", "ReferenceStateVectorFile"]
+conditional_dict["SatelliteDiagnostics"] = [
+    "OverpassTime",
+    "OrbitDirection",
+    "OrbitsPerDay",
+    "DoSatelliteDiagnostics", # to calculate satellite diagnostics or not from Jacobian runs
+    "SatDiagOperator", # to use the processed satellite diagnostics or not when calculating Jacobians
+]
 
 def raise_error_message(var):
     """

@@ -277,6 +277,19 @@ create_simulation_dir() {
                 -e 's/StateMetLevEdge.frequency:   00000100 000000/StateMetLevEdge.frequency:   00000000 010000/g' \
                 -e 's/StateMetLevEdge.duration:    00000100 000000/StateMetLevEdge.duration:    00000001 000000/g' HISTORY.rc
         fi
+
+        # add additional diagnostics for the base run if satellite diagnostics are requested
+        if "$SatelliteDiagnostics"; then
+            if "$UseGCHP"; then
+                sed -i -e "/ 'SpeciesConcVV_/a\\
+                        'Met_AIRDEN     ', 'GCHPchem',\\
+                        'Met_BXHEIGHT   ', 'GCHPchem'," HISTORY.rc
+            else
+                sed -i -e "/ 'SpeciesConcVV_/a\\
+                        'Met_AIRDEN',\\
+                        'Met_BXHEIGHT'," HISTORY.rc
+            fi
+        fi
     fi
     # disable Restart for all runs
     if ! "$UseGCHP"; then
@@ -478,9 +491,8 @@ create_simulation_dir() {
 
                 # remove redundant SpeciesConcVV_CH4 when $x > 1
                 if "$UseGCHP"; then
-                    if [ $x -gt 1 ]; then
-                        perl -0777 -pe "s/'SpeciesConcVV_CH4\s*',\s*'GCHPchem',\s*\n\s*('SpeciesConcVV_CH4_\d{4}',\s*'GCHPchem',)/\1/" \
-                        -i HISTORY.rc
+                    if [ "$x" -gt 1 ]; then
+                        perl -0777 -i -pe "s/'SpeciesConcVV_CH4\s*',\s*'GCHPchem',\s*\n\s*('SpeciesConcVV_CH4_jac\d{4}',\s*'GCHPchem',)/\1/" HISTORY.rc
                     fi
                 fi
             fi
@@ -704,6 +716,43 @@ run_jacobian() {
         wait
         printf "Got Jacobian scale factors\n"
     fi
+}
+
+# Calculate 2D CH4 column density in mole/m2 at satellite overpass times and locations for comparison to satellite observations
+calculate_overpass_diagnostics() {
+    printf "\n=== CALCULATING OVERPASS DIAGNOSTICS ===\n"
+    
+    overpass_start=$(date +%s)
+    if "$UseSlurm"; then
+        
+        overpass_log="${RunDirs}/imi_output_overpass.tmp"
+        overpass_status="${RunDirs}/.overpass_error_status.txt"
+
+        rm -f "$overpass_status" "$overpass_log"
+
+        sbatch --mem "$RequestedMemory" \
+            -c "$RequestedCPUs" \
+            -t "$RequestedTime" \
+            -p "$SchedulerPartition" \
+            -J "overpass_diag" \
+            -o "$overpass_log" \
+            -W \
+            --wrap "python ${InversionPath}/src/inversion_scripts/calculate_satellite_overpass_diagnostics.py ${ConfigPath} ${nElements} ${prevCPUs}"
+        rc=$?
+
+        cat "$overpass_log" >> "${RunDirs}/imi_output.log"
+
+        if [ "$rc" -ne 0 ]; then
+            printf "\nOverpass diagnostics Slurm job failed with exit code %s. See:\n%s\n" "$rc" "$overpass_log"
+            imi_failed $LINENO
+        fi
+
+    else
+        python ${InversionPath}/src/inversion_scripts/calculate_satellite_overpass_diagnostics.py $ConfigPath $nElements
+    fi
+
+    overpass_end=$(date +%s)
+    printf "\n=== DONE CALCULATING OVERPASS DIAGNOSTICS (Time taken: %d seconds) ===\n" $((overpass_end - overpass_start))
 }
 
 # Description: Print perturbation string for BC optimization

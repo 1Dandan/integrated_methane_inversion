@@ -11,8 +11,10 @@ from src.inversion_scripts.utils import (
     filter_tropomi,
     filter_blended,
     get_strdate,
+    get_local_date,
     check_is_OH_element,
     check_is_BC_element,
+    build_pert_simulations_dict,
 )
 
 from src.inversion_scripts.operators.operator_utilities import (
@@ -195,20 +197,36 @@ def apply_average_tropomi_operator(
                                          obs_mapped_to_gc["iGC"] # lon
                                          ), GC_shape)
     
-    all_strdate = [gridcell["time"] for gridcell in obs_mapped_to_gc]
+    # calculate Jacobian
+    if config.get("SatDiagOperator", False):
+        time_varname = "local_date"
+    else:
+        time_varname = "time"
+    all_strdate = [gridcell[time_varname] for gridcell in obs_mapped_to_gc]
     all_strdate = list(set(all_strdate))
     
     for strdate in all_strdate:
-        gridcell_dict = obs_mapped_to_gc[obs_mapped_to_gc["time"] == strdate]
-        sel_idx = np.where(obs_mapped_to_gc["time"] == strdate)[0]
-        if build_jacobian:
-            virtual_tropomi_pert, virtual_tropomi_base, virtual_tropomi = get_virtual_tropomi(
-                strdate, gc_cache, gridcell_dict, n_elements, config, build_jacobian
+        gridcell_dict = obs_mapped_to_gc[obs_mapped_to_gc[time_varname] == strdate]
+        sel_idx = np.where(obs_mapped_to_gc[time_varname] == strdate)[0]
+        
+        if config.get("SatDiagOperator", False):
+            virtual_tropomi, vertical_frac, sat_sim_col_ratio = get_virtual_tropomi_SatDiag(
+                strdate, gridcell_dict, config
             )
         else:
-            virtual_tropomi = get_virtual_tropomi(
-                strdate, gc_cache, gridcell_dict, n_elements, config, build_jacobian
+            virtual_tropomi, vertical_weights = get_virtual_tropomi(
+                strdate, gc_cache, gridcell_dict, config
             )
+        if build_jacobian:
+            if config.get("SatDiagOperator", False):
+                virtual_tropomi_pert, virtual_tropomi_base = get_virtual_tropomi_SatDiag_pert_all(
+                    config, strdate, gridcell_dict, n_elements, vertical_frac, sat_sim_col_ratio
+                )
+            else:
+                virtual_tropomi_pert, virtual_tropomi_base = get_virtual_tropomi_pert_all(
+                    config, strdate, gridcell_dict, n_elements, vertical_weights
+                )
+        
         # Save actual and virtual TROPOMI data
         obs_GC[sel_idx, 0] = gridcell_dict[
             "methane"
@@ -963,6 +981,7 @@ def average_tropomi_observations(TROPOMI, gc_lat_lon, sat_ind, time_threshold):
         ("iGC","i4"), ("jGC","i4"),
         ("lat_sat","f4"), ("lon_sat","f4"),
         ("methane","f4"), ("time","U13"),
+        ("local_date", "U8"),
         ("p_sat","f4",(n_lev_p,)),
         ("dry_air_subcolumns","f4",(n_lev_dryair,)),
         ("apriori","f4",(n_lev_apriori,)),
@@ -970,7 +989,7 @@ def average_tropomi_observations(TROPOMI, gc_lat_lon, sat_ind, time_threshold):
         ("observation_count","f4"),
         ("lat","f4"), ("lon","f4"),
     ]
-
+    
     arr = np.zeros(len(gridcell_dicts), dtype=dtype_latlon)
 
     for idx, cell in enumerate(gridcell_dicts):
@@ -987,7 +1006,12 @@ def average_tropomi_observations(TROPOMI, gc_lat_lon, sat_ind, time_threshold):
         arr["observation_count"][idx] = np.float32(cell["observation_count"])
         arr["lat"][idx] = np.float32(cell["lat"])
         arr["lon"][idx] = np.float32(cell["lon"])
-
+        
+        arr["local_date"][idx] = get_local_date(
+            cell["time"],
+            cell["lon_sat"],
+        )
+    
     return arr
 
 def average_tropomi_observations_to_CSgrid(TROPOMI, filename, sat_ind, time_threshold, 
@@ -1074,6 +1098,15 @@ def average_tropomi_observations_to_CSgrid(TROPOMI, filename, sat_ind, time_thre
     sat_time_avg = pd.to_datetime(sat_time_avg)  # convert back to datetime
     sat_time_str = np.array([get_strdate(t, time_threshold) for t in sat_time_avg])
 
+    utc_offset = sat_lon_avg / 15.0
+
+    local_time_avg = (
+        sat_time_avg
+        + pd.to_timedelta(utc_offset, unit="h")
+    )
+
+    local_date = local_time_avg.strftime("%Y%m%d")
+    
     # --- Multi-dimensional arrays ---
     def weighted_avg_profiles(var_flat):
         # var_flat: (n_valid_obs, n_lev)
@@ -1104,7 +1137,7 @@ def average_tropomi_observations_to_CSgrid(TROPOMI, filename, sat_ind, time_thre
     dtype = [
         ("nfi", "i4"), ("Ydimi", "i4"), ("Xdimi", "i4"),
         ("lat_sat", "f4"), ("lon_sat", "f4"), ("methane", "f4"),
-        ("time", "U13"), ("p_sat", "f4", (n_lev_p,)),
+        ("time", "U13"), ("local_date", "U8"), ("p_sat", "f4", (n_lev_p,)),
         ("dry_air_subcolumns", "f4", (n_lev_dryair,)),
         ("apriori", "f4", (n_lev_apriori,)), ("avkern", "f4", (n_lev_avkern,)),
         ("observation_count", "f4")
@@ -1118,6 +1151,7 @@ def average_tropomi_observations_to_CSgrid(TROPOMI, filename, sat_ind, time_thre
     output_dicts["lon_sat"] = sat_lon_avg
     output_dicts["methane"] = sat_ch4_avg
     output_dicts["time"] = sat_time_str
+    output_dicts["local_date"] = local_date
     output_dicts["p_sat"] = p_sat_avg
     output_dicts["dry_air_subcolumns"] = dryair_avg
     output_dicts["apriori"] = apriori_avg
@@ -1126,7 +1160,7 @@ def average_tropomi_observations_to_CSgrid(TROPOMI, filename, sat_ind, time_thre
 
     return output_dicts
 
-def get_virtual_tropomi(date, gc_cache, gridcell_dict, n_elements, config, build_jacobian=False):
+def get_virtual_tropomi(date, gc_cache, gridcell_dict, config):
     """
     Generate virtual TROPOMI methane observations from GEOS-Chem.
 
@@ -1142,19 +1176,12 @@ def get_virtual_tropomi(date, gc_cache, gridcell_dict, n_elements, config, build
         Path to GEOS-Chem output files.
     gridcell_dict : dict
         Gridcell info with obs indices and satellite data.
-    n_elements : int
-        Number of state vector elements.
     config : dict
         Inversion configuration options.
-    build_jacobian : bool, optional
-        Whether to compute sensitivities (default False).
-
+    
     Returns
     -------
-    If build_jacobian=False:
-        ndarray (N,) of virtual TROPOMI columns.
-    If build_jacobian=True:
-        (perturbation columns, base columns, final columns).
+    ndarray (N,) of virtual TROPOMI columns from the simulation with prior emissions (RunName_0000 CH4).
     """
 
     UseGCHP = config['UseGCHP']
@@ -1241,119 +1268,7 @@ def get_virtual_tropomi(date, gc_cache, gridcell_dict, n_elements, config, build
         np.sum(dry_air_subcolumns, axis=1)
     ).astype(np.float32)                      # (N,), unitless mixing ratio
     
-    # If need to construct Jacobian, read sensitivity data from GEOS-Chem perturbation simulations
-    if build_jacobian:
-        gc_date = pd.to_datetime(date, format="%Y%m%d_%H")
-        if config['PrecomputedJacobian']:
-            if config['OnlyEmisPrecomputedK']:
-                run_num = []
-
-                # "0000" is the base run, "0001" is the pertubation run for "CH4" only with zero emissions
-                # BCs and OH perturbation runs start from "0002"
-                if config['OptimizeBCs']:
-                    run_num += [2, 3, 4, 5]
-                    if config['OptimizeOH']:
-                        if config['isRegional']:
-                            run_num += [6]
-                        else:
-                            run_num += [6, 7]
-                else:
-                    if config['OptimizeOH']:
-                        if config['isRegional']:
-                            run_num += [2]
-                        else:
-                            run_num += [2, 3]
-
-                if len(run_num) == 0:
-                    raise ValueError(
-                        "build_jacobian is True while OnlyEmisPrecomputedK is True and neither "
-                        "OptimizeBCs nor OptimizeOH is True — no Jacobian calculation is needed."
-                    )
-                
-                virtual_tropomi_pert = [
-                    get_virtual_tropomi_pert(gc_date, f"{k:04d}", gridcell_dict, config, [0], n_elements, vertical_weights)
-                    for k in run_num
-                ]
-
-        else:
-            emis_elements = n_elements
-            if config['OptimizeOH']:
-                emis_elements -= 2 if config['isRegional'] else 1
-            if config['OptimizeBCs']:
-                emis_elements -= 4
-            ntracers = config["NumJacobianTracers"]
-            opt_OH = config["OptimizeOH"]
-            opt_BC = config["OptimizeBCs"]
-            is_Regional = config["isRegional"]
-
-            num_BC = 4
-            if is_Regional:
-                num_OH = 1
-            else:
-                num_OH = 2
-
-            n_base_runs = (
-                n_elements - int(opt_OH * num_OH) - (int(opt_BC) * num_BC)
-            ) / ntracers
-
-            nruns = (
-                np.ceil(n_base_runs).astype(int)
-                + (int(opt_OH) * num_OH)
-                + (int(opt_BC) * num_BC)
-            )
-
-            # Dictionary that stores mapping of state vector elements to
-            # perturbation simulation numbers
-            pert_simulations_dict = {}
-            for e in range(n_elements):
-                # State vector elements are numbered 1..nelements
-                sv_elem = e + 1
-
-                is_OH_element = check_is_OH_element(
-                    sv_elem, n_elements, opt_OH, is_Regional
-                )
-                is_BC_element = check_is_BC_element(
-                    sv_elem, n_elements, opt_OH, opt_BC, is_OH_element, is_Regional
-                )
-                # Determine which run directory to look in
-                if is_OH_element:
-                    if is_Regional:
-                        run_number = nruns
-                    else:
-                        num_back = n_elements % sv_elem
-                        run_number = nruns - num_back
-                elif is_BC_element:
-                    num_back = n_elements % sv_elem
-                    run_number = nruns - num_back
-                else:
-                    run_number = np.ceil(sv_elem / ntracers).astype(int)
-
-                run_num = str(run_number).zfill(4)
-
-                # add the element to the dictionary for the relevant simulation number
-                if run_num not in pert_simulations_dict:
-                    pert_simulations_dict[run_num] = [sv_elem]
-                else:
-                    pert_simulations_dict[run_num].append(sv_elem)
-        
-            
-            virtual_tropomi_pert = [
-                get_virtual_tropomi_pert(gc_date, k, gridcell_dict, config, v, n_elements, vertical_weights)
-                for k, v in pert_simulations_dict.items()
-            ]
-
-        if len(virtual_tropomi_pert) > 1:
-            virtual_tropomi_pert = np.concatenate(virtual_tropomi_pert, axis=1)
-
-        
-        virtual_tropomi_base = get_virtual_tropomi_pert(
-            gc_date, "0001", gridcell_dict, config, [0], n_elements, vertical_weights, baserun=True
-        )
-    
-    if build_jacobian:
-        return virtual_tropomi_pert, virtual_tropomi_base, virtual_tropomi
-    else:
-        return virtual_tropomi
+    return virtual_tropomi, vertical_weights
 
 def get_virtual_tropomi_pert(gc_date, run_id, gridcell_dict, config, sv_elems, n_elements, vertical_weights, baserun=False):
     """
@@ -1392,6 +1307,8 @@ def get_virtual_tropomi_pert(gc_date, run_id, gridcell_dict, config, sv_elems, n
         config["OutputPath"] + "/" + config["RunName"] + "/jacobian_runs"
     )
     j_dir = f"{prefix}/{config['RunName']}_{run_id}/OutputDir"
+    
+    gc_date = pd.to_datetime(gc_date, format="%Y%m%d_%H")
     file_stub = gc_date.strftime("GEOSChem.SpeciesConc.%Y%m%d_0000z.nc4")
     filepath = os.path.join(j_dir, file_stub)
     
@@ -1492,3 +1409,398 @@ def get_virtual_tropomi_pert(gc_date, run_id, gridcell_dict, config, sv_elems, n
                 virtual_tropomi_all = (numer_all / denom[None, :]).T.astype(np.float32)  # (N, E)
 
     return virtual_tropomi_all # unitless mixing ratio
+
+def get_virtual_tropomi_pert_all(config, date, gridcell_dict, n_elements, vertical_weights):
+    # If need to construct Jacobian, read sensitivity data from GEOS-Chem perturbation simulations
+    
+    
+    if config['PrecomputedJacobian']:
+        if config['OnlyEmisPrecomputedK']:
+            run_num = []
+
+            # "0000" is the base run, "0001" is the pertubation run for "CH4" only with zero emissions
+            # BCs and OH perturbation runs start from "0002"
+            if config['OptimizeBCs']:
+                run_num += [2, 3, 4, 5]
+                if config['OptimizeOH']:
+                    if config['isRegional']:
+                        run_num += [6]
+                    else:
+                        run_num += [6, 7]
+            else:
+                if config['OptimizeOH']:
+                    if config['isRegional']:
+                        run_num += [2]
+                    else:
+                        run_num += [2, 3]
+
+            if len(run_num) == 0:
+                raise ValueError(
+                    "build_jacobian is True while OnlyEmisPrecomputedK is True and neither "
+                    "OptimizeBCs nor OptimizeOH is True — no Jacobian calculation is needed."
+                )
+            
+            virtual_tropomi_pert = [
+                get_virtual_tropomi_pert(date, f"{k:04d}", gridcell_dict, config, [0], n_elements, vertical_weights)
+                for k in run_num
+            ]
+
+    else:
+        # Dictionary that stores mapping of state vector elements to
+        # perturbation simulation numbers
+        pert_simulations_dict = build_pert_simulations_dict(
+            config,
+            n_elements,
+        )
+        
+        virtual_tropomi_pert = [
+            get_virtual_tropomi_pert(date, k, gridcell_dict, config, v, n_elements, vertical_weights)
+            for k, v in pert_simulations_dict.items()
+        ]
+
+    if len(virtual_tropomi_pert) > 1:
+        virtual_tropomi_pert = np.concatenate(virtual_tropomi_pert, axis=1)
+
+    virtual_tropomi_base = get_virtual_tropomi_pert(
+        date, "0001", gridcell_dict, config, [0], n_elements, vertical_weights, baserun=True
+    )
+
+    return virtual_tropomi_pert, virtual_tropomi_base
+
+def get_virtual_tropomi_SatDiag(local_date, gridcell_dict, config):
+    """
+    Generate virtual TROPOMI methane observations from GEOS-Chem.
+
+    Extracts CH4 and pressure from GEOS-Chem, remaps to TROPOMI layers, 
+    and applies averaging kernels. Optionally computes Jacobian using 
+    perturbation runs.
+
+    Parameters
+    ----------
+    date : str
+        Date of interest ("YYYYMMDD"). local date
+    gc_cache : str
+        Path to GEOS-Chem output files.
+    gridcell_dict : dict
+        Gridcell info with obs indices and satellite data.
+    config : dict
+        Inversion configuration options.
+    
+    Returns
+    -------
+    ndarray (N,) of virtual TROPOMI columns from the simulation with prior emissions (RunName_0000 CH4).
+    """
+    UseGCHP = config['UseGCHP']
+    OverpassTime = config["OverpassTime"]
+    overpass_tag = OverpassTime.replace(":", "")  # "1330"
+    prefix = os.path.expandvars(
+        config["OutputPath"] + "/" + config["RunName"] + "/jacobian_runs"
+    )
+    
+    run_id = "0000"
+    j_dir = f"{prefix}/{config['RunName']}_{run_id}/OverpassDiagnostics"
+    
+    # Assemble file paths to GEOS-Chem output collections for input data
+    file_species = f"GEOSChem.SpeciesConc.overpass.{local_date}_{overpass_tag}.nc4"
+    file_pedge = f"GEOSChem.StateMetLevEdge.overpass.{local_date}_{overpass_tag}.nc4"
+
+    # Read lat, lon, CH4 from the SpeciecConc collection
+    filename = os.path.join(j_dir, file_species)
+
+    # It would fail if open all variables with chunks with GCHP,
+    # as ncontact is duplicate for GCHP output dimensions
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, module="xarray")
+        with xr.open_dataset(filename, decode_cf=False) as tmp:
+            other_vars = [v for v in tmp.variables if "SpeciesConcVV_CH4" not in v and "Met_" not in v]
+    
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, module="xarray")
+        with dask.config.set({"array.slicing.split_large_chunks": False}):
+            with xr.open_dataset(filename, drop_variables=other_vars,
+                                 chunks='auto') as gc_data_all:
+                if UseGCHP:
+                    nfi   = xr.DataArray(gridcell_dict["nfi"],   dims="obs")
+                    Ydimi = xr.DataArray(gridcell_dict["Ydimi"], dims="obs")
+                    Xdimi = xr.DataArray(gridcell_dict["Xdimi"], dims="obs")
+        
+                    gc_data = gc_data_all.isel(
+                        nf=nfi,
+                        Ydim=Ydimi,
+                        Xdim=Xdimi,
+                        drop=True
+                    )
+                else:
+                    jGC   = xr.DataArray(gridcell_dict["jGC"],   dims="obs")
+                    iGC   = xr.DataArray(gridcell_dict["iGC"],   dims="obs")
+                    gc_data = gc_data_all.isel(
+                        lat=jGC,
+                        lon=iGC,
+                        drop=True
+                    )
+                CH4 = gc_data["SpeciesConcVV_CH4"].transpose("obs","lev").values # mixing ratio
+                Met_AIRDEN = gc_data["Met_AIRDEN"].transpose("obs","lev").values * 1e3 # converted from kg/m3 to g/m3
+                Met_BXHEIGHT = gc_data["Met_BXHEIGHT"].transpose("obs","lev").values # in m
+
+    # Read PEDGE from the StateMetLevEdge collection
+    filename = os.path.join(j_dir, file_pedge)
+    
+    # It would fail if open all variables with chunks with GCHP,
+    # as ncontact is duplicate for GCHP output dimensions
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, module="xarray")
+        with xr.open_dataset(filename, decode_cf=False) as tmp:
+            other_vars = [v for v in tmp.variables if "Met_PEDGE" not in v]
+            
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, module="xarray")
+        with dask.config.set({"array.slicing.split_large_chunks": False}):
+            with xr.open_dataset(filename, drop_variables=other_vars,
+                                 chunks='auto') as gc_data_all:
+                if UseGCHP:
+                    gc_data = gc_data_all.isel(
+                        nf=nfi,
+                        Ydim=Ydimi,
+                        Xdim=Xdimi,
+                        drop=True
+                    )
+                else:
+                    gc_data = gc_data_all.isel(
+                        lat=jGC,
+                        lon=iGC,
+                        drop=True
+                    )
+                lev_dim = "lev" if "lev" in gc_data["Met_PEDGE"].dims else "ilev"
+                PEDGE = gc_data["Met_PEDGE"].transpose("obs", lev_dim).values
+
+    n_superobs = len(gridcell_dict)
+    virtual_tropomi = np.empty([n_superobs, ], dtype=np.float32)
+    virtual_tropomi.fill(np.nan)
+    
+    p_sat = gridcell_dict["p_sat"]
+    dry_air_subcolumns = gridcell_dict["dry_air_subcolumns"]  # mol m-2
+    apriori = gridcell_dict["apriori"]  # mol m-2
+    avkern = gridcell_dict["avkern"]
+
+    # (N, S, G)  sums to 1 along G, where 
+    # N is the number of super observations
+    # S is the number of TROPOMI pressure edges
+    # G is the number of GEOS-Chem pressure edges
+    vertical_weights = remapping_weights(p_sat, PEDGE)
+    sat_CH4 = np.einsum("nsg,ng->ns", vertical_weights, CH4)         # (N, S)
+    sat_CH4_molm2 = sat_CH4 * dry_air_subcolumns                     # (N, S)
+    virtual_tropomi = (
+        np.sum(apriori + avkern * (sat_CH4_molm2 - apriori), axis=1) / \
+        np.sum(dry_air_subcolumns, axis=1)
+    ).astype(np.float32)                      # (N,), unitless mixing ratio
+
+    sat_CH4_molm2_total = sat_CH4_molm2.sum(axis=1)        # (N,)
+    vertical_frac = sat_CH4_molm2 / sat_CH4_molm2_total[:, None] # (N, S)
+    
+    # calculate the total column density ratio between simulation and satellite
+    #  due to the differences in the sampled column depth
+    # calculate the columnar density in mol/m2 with simulated AirDen and BXHEIGHT
+    MwAir = 28.97 # g / mol
+    sim_CH4_molm2_total = np.nansum(CH4 * Met_AIRDEN / MwAir * Met_BXHEIGHT, axis=1) # (N, )
+    sat_sim_col_ratio = sat_CH4_molm2_total / sim_CH4_molm2_total
+    return virtual_tropomi, vertical_frac, sat_sim_col_ratio
+
+def get_virtual_tropomi_SatDiag_pert(
+    gc_local_date,
+    run_id,
+    sv_elems,
+    config,
+    gridcell_dict,
+    n_elements,
+    vertical_frac, 
+    sat_sim_col_ratio,
+):
+    """
+    Calculate virtual TROPOMI methane columns from GEOS-Chem satellite overpass
+    diagnostics for a given date and perturbation run.
+
+    This function:
+    1. Loads GEOS-Chem CH4 overpass diagnostics for the requested run/date.
+    2. Extracts model values only at valid TROPOMI observation gridcells.
+    3. Reconstructs a simplified vertical CH4 profile using TROPOMI dry-air
+       subcolumn fractions.
+    4. Applies TROPOMI averaging kernels (AKs) and prior profile to produce
+       a virtual TROPOMI XCH4 retrieval consistent with the satellite operator.
+
+    Notes
+    -----
+    - For base simulation (`sv_elems == [0]`), use SpeciesConcVV_CH4_col.
+    - For perturbation simulations, use jacobian tracers
+      (SpeciesConcVV_CH4_jacXXXX_col) plus the reference of RunName_0001 containing SpeciesConcVV_CH4_col
+    - OH and BC perturbation runs may only contain the base CH4 tracer,
+      so fallback logic is required.
+    - Output shape is (n_obs, n_tracers_in_run).
+
+    Parameters
+    ----------
+    gc_local_date : date
+        Local date corresponding to the GEOS-Chem overpass file date.
+    run_id : str
+        Jacobian run identifier (e.g., 0001, 0002, ...).
+    sv_elems : list[int]
+        State vector elements represented in this run.
+        [0] indicates the base simulation.
+    config : dict
+        IMI configuration dictionary.
+    gridcell_dict : dict
+        Contains pre-matched TROPOMI observation indices and retrieval fields:
+            - dry_air_subcolumns : (obs, layer)
+            - apriori            : (obs, layer)
+            - avkern             : (obs, layer)
+            - grid indices for GCC or GCHP
+    n_elements : int
+        Total number of state vector elements.
+    vertical_frac: float
+        Vertical fraction from base run to redistribute 2D total column to 3D fields at observation vertical layers
+    sat_sim_col_ratio: float
+        The total columnar density ratio due to different sampled vertical column coverage
+
+    Returns
+    -------
+    virtual_tropomi_all : np.ndarray
+        Virtual TROPOMI methane mixing ratio, shape:
+        (n_obs, n_tracers_in_run)
+    """
+    
+    
+    OverpassTime = config["OverpassTime"]
+    overpass_tag = OverpassTime.replace(":", "")  # "1330"
+    prefix = os.path.expandvars(
+        config["OutputPath"] + "/" + config["RunName"] + "/jacobian_runs"
+    )
+    j_dir = f"{prefix}/{config['RunName']}_{run_id}/OverpassDiagnostics"
+    
+    gc_local_date = pd.to_datetime(str(gc_local_date), format="%Y%m%d")
+
+    file_stub = gc_local_date.strftime(
+        f"GEOSChem.CH4col.overpass.%Y%m%d_{overpass_tag}.nc4"
+    )
+    
+    filepath = os.path.join(j_dir, file_stub)
+    
+    if sv_elems == [0]:
+        keepvars = ['SpeciesConcVV_CH4']
+    else:
+        # Construct the list of CH4 vars to request
+        # Local tracer indices are 1..len(sv_elems) within this run
+        local_indices = range(1, len(sv_elems) + 1)
+        keepvars = [f"SpeciesConcVV_CH4_jac{idx:04d}" for idx in local_indices]
+        if len(keepvars) == 1:
+            is_Regional = config["isRegional"]
+            is_OH_element = check_is_OH_element(
+                sv_elems[0], n_elements, config["OptimizeOH"], is_Regional
+            )
+            is_BC_element = check_is_BC_element(
+                sv_elems[0],
+                n_elements,
+                config["OptimizeOH"],
+                config["OptimizeBCs"],
+                is_OH_element,
+                is_Regional,
+            )
+            if is_OH_element or is_BC_element:
+                keepvars = ["SpeciesConcVV_CH4"]
+
+    # add _col suffix to variable names for the overpass diagnostics files
+    keepvars_col = [f"{var}_col" for var in keepvars]
+    
+    # It would fail if open all variables with chunks with GCHP,
+    # as ncontact is duplicate for GCHP output dimensions
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, module="xarray")
+        with xr.open_dataset(filepath, decode_cf=False) as tmp:
+            other_vars = [v for v in tmp.variables if "SpeciesConcVV_CH4" not in v]
+    
+    # Open only these variables
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, module="xarray")
+        with dask.config.set({"array.slicing.split_large_chunks": False}):
+            with xr.open_dataset(
+                filepath,
+                drop_variables=other_vars,
+                chunks="auto"
+            ) as dsmf_all:
+                try:
+                    if config['UseGCHP']:
+                        nfi   = xr.DataArray(gridcell_dict["nfi"],   dims="obs")
+                        Ydimi = xr.DataArray(gridcell_dict["Ydimi"], dims="obs")
+                        Xdimi = xr.DataArray(gridcell_dict["Xdimi"], dims="obs")
+                        dsmf = dsmf_all.isel( 
+                            nf=nfi,
+                            Ydim=Ydimi,
+                            Xdim=Xdimi,
+                            drop=True
+                        )
+                    else:
+                        jGC   = xr.DataArray(gridcell_dict["jGC"],   dims="obs")
+                        iGC   = xr.DataArray(gridcell_dict["iGC"],   dims="obs")
+                        dsmf = dsmf_all.isel( 
+                            lat=jGC,
+                            lon=iGC,
+                            drop=True
+                        )
+                    
+                    
+                except Exception as e:
+                    print(f"Run id {run_id}. Failed at {gc_local_date} with error: {e}", flush=True)
+                    raise
+                
+                dry_air_subcolumns = gridcell_dict["dry_air_subcolumns"]  # (obs, n_layer) in unit of mol/m2
+                apriori = gridcell_dict["apriori"]                        # (obs, n_layer) in unit of mol/m2
+                avkern = gridcell_dict["avkern"]                          # (obs, n_layer)
+                denom = np.sum(dry_air_subcolumns, axis=1)                # (obs,)
+                
+                # get the 3D vertical shape of CH4 from the vertical fraction of RunName_0000
+                # ---- Batch read all CH4 tracers and standardize to (elem, obs, n_layer)
+                da_list = []
+                for v in keepvars_col:
+                    da = dsmf[v].values * sat_sim_col_ratio # (obs,) # in mol/m2
+                    da_3D = da[:, np.newaxis] * vertical_frac # (obs, n_layer)
+                    da_list.append(da_3D)
+                sat_CH4_molm2_all = np.stack(da_list, axis=0)   # (elem, obs, n_layer)
+                
+                # Convert to column units and apply AKs, batched over vertical layers
+                numer_all = np.nansum(apriori[None, :, :] +
+                                avkern[None, :, :] * (sat_CH4_molm2_all - apriori[None, :, :]),
+                                axis=2)  # (elem, obs)
+                virtual_tropomi_all = (numer_all / denom[None, :]).T.astype(np.float32)  # (obs, elem)
+
+    return virtual_tropomi_all # unitless mixing ratio
+
+def get_virtual_tropomi_SatDiag_pert_all(config, date, gridcell_dict, n_elements, vertical_frac, sat_sim_col_ratio):
+    # If need to construct Jacobian, read sensitivity data from GEOS-Chem perturbation simulations
+    
+    # Dictionary that stores mapping of state vector elements to
+    # perturbation simulation numbers
+    pert_simulations_dict = build_pert_simulations_dict(
+        config,
+        n_elements,
+    )
+    
+    virtual_tropomi_pert = [
+        get_virtual_tropomi_SatDiag_pert(
+            date,
+            k,
+            v,
+            config,
+            gridcell_dict,
+            n_elements,
+            vertical_frac,
+            sat_sim_col_ratio
+        ) 
+        for k, v in pert_simulations_dict.items()
+    ]
+
+    if len(virtual_tropomi_pert) > 1:
+        virtual_tropomi_pert = np.concatenate(virtual_tropomi_pert, axis=1)
+
+    virtual_tropomi_base = get_virtual_tropomi_SatDiag_pert(
+        date, "0001", [0], config, gridcell_dict, n_elements, vertical_frac, sat_sim_col_ratio
+    )
+
+    return virtual_tropomi_pert, virtual_tropomi_base
