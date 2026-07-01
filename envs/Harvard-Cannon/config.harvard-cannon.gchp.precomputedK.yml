@@ -161,6 +161,10 @@ SetupSpinupRun: false
 SetupJacobianRuns: false
 SetupInversion: false
 SetupPosteriorRun: false
+# If we only need to calculate Jacobians for emission/BC state vector elements,
+#   which means we only need base run of 0001 and Run0000 is not needed,
+#   we can disable Run0000 to save computing cost, default to false
+DisableRun0000: false
 
 ## Run modules
 ##   Turn on/off different steps in performing the inversion
@@ -172,6 +176,11 @@ DoSatelliteDiagnostics: false
 # Use satellite diagnostics to compute the Jacobian (i.e. satellite operator) for the inversion
 SatDiagOperator: false
 DoInversion: false
+# If we only need to calculate Jacobians for emission/BC state vector elements,
+#  and if DisableRun0000 is true, we cannot run invert.py to calculate posterior results, 
+#  as Run0000 (and thus obs_GC) will be undefined in the archived pkl file
+#  The purpose of this IMI is to archive Jacobians and to be applied for another inversion
+ArchiveJacobiansOnly: false
 DoPosterior: false
 
 ## IMI preview

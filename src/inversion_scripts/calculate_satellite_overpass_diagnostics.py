@@ -88,7 +88,7 @@ def load_overpass_grid(config, JacobianRunDirs, CSgridDir, StartDate):
 
     if not os.path.isfile(overpass_grid_fpath):
         # a sample simulation output from base run to get the grid information
-        Jacobian_RunDir = os.path.join(JacobianRunDirs, f"{RunName}_0000")
+        Jacobian_RunDir = os.path.join(JacobianRunDirs, f"{RunName}_0001")
         grid_file = os.path.join(
             Jacobian_RunDir,
             f"OutputDir/GEOSChem.SpeciesConc.{StartDate}_0000z.nc4",
@@ -198,7 +198,7 @@ def load_met_fields(met_file):
 # ---------------------------------------------------------------------------
 # Helper: pre-save met arrays as .npy for memory-mapped access
 # ---------------------------------------------------------------------------
-def presave_met_arrays(date_list, utc_start, utc_end, JacobianRunDirs, RunName, tmp_dir):
+def presave_met_arrays(date_list, utc_start, utc_end, JacobianRunDirs, RunName, tmp_dir, DisableRun0000=False):
     """Pre-save met arrays for available UTC simulation dates only.
 
     date_list contains local overpass dates. For each local date D, sampling may
@@ -207,6 +207,13 @@ def presave_met_arrays(date_list, utc_start, utc_end, JacobianRunDirs, RunName, 
     If either UTC date is outside [utc_start, utc_end), we leave the
     corresponding met path as None. Later, those grid cells remain NaN.
     """
+    
+    if DisableRun0000:
+        run_id = 1
+        prefix = 'BaseSpeciesConc'
+    else:
+        run_id = 0
+        prefix = 'SpeciesConc'
     met_paths = {}
 
     def utc_date_is_available(date_dt):
@@ -219,8 +226,8 @@ def presave_met_arrays(date_list, utc_start, utc_end, JacobianRunDirs, RunName, 
             return None
 
         met_file = os.path.join(
-            JacobianRunDirs, f"{RunName}_0000",
-            f"OutputDir/GEOSChem.SpeciesConc.{date_str}_0000z.nc4",
+            JacobianRunDirs, f"{RunName}_{run_id:04d}",
+            f"OutputDir/GEOSChem.{prefix}.{date_str}_0000z.nc4",
         )
 
         if not os.path.isfile(met_file):
@@ -427,18 +434,16 @@ def sample_overpass_3D(
 
     return out_ds
 
-def sample_run0_file_type(
+def sample_baserun_file_type(
     Jacobian_RunDir,
     file_prefix,
     date_str,
     next_date_str,
-    current_available,
-    next_available,
     closest_hour,
     day_offset,
     dims,
 ):
-    """Sample one run_i == 0 file type at local overpass time."""
+    """Sample one baserun file type at local overpass time."""
 
     file_current = os.path.join(
         Jacobian_RunDir,
@@ -453,13 +458,13 @@ def sample_run0_file_type(
     with ExitStack() as stack:
         ds_current = (
             stack.enter_context(xr.open_dataset(file_current))
-            if current_available is not None and os.path.isfile(file_current)
+            if os.path.isfile(file_current)
             else None
         )
 
         ds_next = (
             stack.enter_context(xr.open_dataset(file_next))
-            if next_available is not None and os.path.isfile(file_next)
+            if os.path.isfile(file_next)
             else None
         )
 
@@ -491,21 +496,26 @@ def process_run_day(
     coords,
     lon_name,
     lat_name,
+    DisableRun0000=False,
 ):
     """Process one Jacobian run for one day: compute overpass columns and write output.
 
-    Met arrays are memory-mapped from pre-saved .npy files.  The OS
-    shares the underlying physical pages between all workers that
-    process the same day, so memory cost is ~1 copy per day regardless
-    of how many workers read it.
+    Met arrays are memory-mapped from pre-saved .npy files. The OS shares the
+    underlying physical pages between all workers that process the same day, so
+    memory cost is ~1 copy per day regardless of how many workers read it.
 
-    Coordinates (lat/lon) are embedded via the ``coords`` dict passed
-    to each ``xr.DataArray``.  They must NOT be separately assigned to
-    the output Dataset (e.g. ``output_ds[lat_name] = ...``), as that
-    would duplicate the definition and cause an xarray MergeError.
+    If DisableRun0000=True, Run 0000 is skipped. In that case, Run 0001 is used
+    to sample BaseSpeciesConc and StateMetLevEdge, then the normal CH4 column
+    diagnostic is also computed from SpeciesConc.
     """
-    # Suppress xarray warnings in worker processes (loky spawns fresh
-    # processes that don't inherit the parent's warning filters)
+
+    # ------------------------------------------------------------------
+    # Skip Run 0000 entirely when it is disabled
+    # ------------------------------------------------------------------
+    if DisableRun0000 and run_i == 0:
+        return
+
+    # Suppress xarray warnings in worker processes
     warnings.filterwarnings(
         "ignore", category=UserWarning, module=r"xarray.*"
     )
@@ -513,81 +523,146 @@ def process_run_day(
         "ignore", message="Duplicate dimension names present.*"
     )
 
-    RunName      = config["RunName"]
+    RunName = config["RunName"]
     OverpassTime = config["OverpassTime"]
+    overpass_tag = OverpassTime.replace(":", "")
 
-    run_num  = str(run_i).zfill(4)
+    run_num = str(run_i).zfill(4)
     sv_elems = pert_simulations_dict.get(run_num, [])
+
+    # Only nonzero runs need keepvars for column calculation.
+    # For DisableRun0000=True, run_i == 1 acts as the base run.
     if run_i != 0:
         baserun = run_i == 1
         keepvars = get_keepvars(sv_elems, n_elements, config, baserun)
 
-    # memory-map the met arrays (read-only, shared via OS page cache)
+    # ------------------------------------------------------------------
+    # Memory-map met arrays
+    # ------------------------------------------------------------------
     current_met = met_paths_day["current"]
     next_met = met_paths_day["next"]
 
-    AirDen = np.load(current_met["AirDen"], mmap_mode="r") if current_met is not None else None
-    BxH = np.load(current_met["BxH"], mmap_mode="r") if current_met is not None else None
+    AirDen = (
+        np.load(current_met["AirDen"], mmap_mode="r")
+        if current_met is not None
+        else None
+    )
+    BxH = (
+        np.load(current_met["BxH"], mmap_mode="r")
+        if current_met is not None
+        else None
+    )
 
-    AirDen_nextday = np.load(next_met["AirDen"], mmap_mode="r") if next_met is not None else None
-    BxH_nextday = np.load(next_met["BxH"], mmap_mode="r") if next_met is not None else None
+    AirDen_nextday = (
+        np.load(next_met["AirDen"], mmap_mode="r")
+        if next_met is not None
+        else None
+    )
+    BxH_nextday = (
+        np.load(next_met["BxH"], mmap_mode="r")
+        if next_met is not None
+        else None
+    )
 
     next_date_str = met_paths_day["next_date_str"]
-    Jacobian_RunDir = os.path.join(JacobianRunDirs, f"{RunName}_{run_i:04d}")
 
-    # sample 3D dataset for "0000" base run
-    if run_i == 0:
-        output_dir = os.path.join(Jacobian_RunDir, "OverpassDiagnostics/")
-        os.makedirs(output_dir, exist_ok=True)
+    Jacobian_RunDir = os.path.join(
+        JacobianRunDirs,
+        f"{RunName}_{run_i:04d}",
+    )
+    output_dir = os.path.join(Jacobian_RunDir, "OverpassDiagnostics")
+    os.makedirs(output_dir, exist_ok=True)
 
-        overpass_tag = OverpassTime.replace(":", "")
+    # ------------------------------------------------------------------
+    # Helper: attach overpass grid metadata without duplicating variables
+    # ------------------------------------------------------------------
+    def attach_overpass_grid_metadata(output_ds):
+        """Attach lat/lon/corner metadata only if not already present."""
 
-        run0_file_types = [
-            "GEOSChem.SpeciesConc",
-            "GEOSChem.StateMetLevEdge",
-        ]
-
-        for file_prefix in run0_file_types:
-            output_ds = sample_run0_file_type(
-                Jacobian_RunDir,
-                file_prefix,
-                date_str,
-                next_date_str,
-                current_met,
-                next_met,
-                closest_hour,
-                day_offset,
-                dims,
-            )
-
-            # Attach overpass-grid lat/lon metadata.
+        if lat_name not in output_ds and lat_name in overpass_ds:
             output_ds[lat_name] = overpass_ds[lat_name]
+
+        if lon_name not in output_ds and lon_name in overpass_ds:
             output_ds[lon_name] = overpass_ds[lon_name]
 
-            if config["UseGCHP"]:
+        if config.get("UseGCHP", False):
+            if "corner_lons" not in output_ds and "corner_lons" in overpass_ds:
                 output_ds["corner_lons"] = overpass_ds["corner_lons"]
+
+            if "corner_lats" not in output_ds and "corner_lats" in overpass_ds:
                 output_ds["corner_lats"] = overpass_ds["corner_lats"]
 
-            output_ds.attrs["date_interpretation"] = (
-                "Filename date is local overpass date. Values are sampled only where "
-                "the corresponding UTC simulation date falls within [StartDate, EndDate). "
-                "Boundary cells outside the UTC window are NaN."
-            )
-            output_ds.attrs["utc_start_date"] = str(config["StartDate"])
-            output_ds.attrs["utc_end_date_exclusive"] = str(config["EndDate"])
+        return output_ds
 
-            # Example:
-            #   GEOSChem.SpeciesConc.overpass.20240501_1330.nc4
-            #   GEOSChem.StateMetLevEdge.overpass.20240501_1330.nc4
+    def add_common_attrs(output_ds):
+        """Add shared metadata attributes."""
+        output_ds.attrs["date_interpretation"] = (
+            "Filename date is local overpass date. Values are sampled only where "
+            "the corresponding UTC simulation date falls within [StartDate, EndDate). "
+            "Boundary cells outside the UTC window are NaN."
+        )
+        output_ds.attrs["utc_start_date"] = str(config["StartDate"])
+        output_ds.attrs["utc_end_date_exclusive"] = str(config["EndDate"])
+        return output_ds
+
+    # ------------------------------------------------------------------
+    # Sample 3D base-run files
+    #
+    # Cases:
+    #   1. Normal mode:
+    #        run_i == 0 samples SpeciesConc + StateMetLevEdge, then returns.
+    #
+    #   2. DisableRun0000 mode:
+    #        run_i == 1 samples BaseSpeciesConc + StateMetLevEdge,
+    #        then continues to compute CH4 column from SpeciesConc.
+    # ------------------------------------------------------------------
+    do_sample_base_3d = (run_i == 0) or (DisableRun0000 and run_i == 1)
+
+    if do_sample_base_3d:
+        if DisableRun0000 and run_i == 1:
+            baserun_file_types = [
+                "GEOSChem.BaseSpeciesConc",
+                "GEOSChem.StateMetLevEdge",
+            ]
+        else:
+            baserun_file_types = [
+                "GEOSChem.SpeciesConc",
+                "GEOSChem.StateMetLevEdge",
+            ]
+
+        for file_prefix in baserun_file_types:
             output_fpath = os.path.join(
                 output_dir,
                 f"{file_prefix}.overpass.{date_str}_{overpass_tag}.nc4",
             )
 
+            # Skip this file if it already exists
+            if os.path.isfile(output_fpath):
+                continue
+
+            output_ds = sample_baserun_file_type(
+                Jacobian_RunDir,
+                file_prefix,
+                date_str,
+                next_date_str,
+                closest_hour,
+                day_offset,
+                dims,
+            )
+
+            output_ds = attach_overpass_grid_metadata(output_ds)
+            output_ds = add_common_attrs(output_ds)
+
             output_ds.to_netcdf(output_fpath, mode="w")
 
-        return
+        # In normal mode, Run 0000 only produces base 3D diagnostics.
+        # In DisableRun0000 mode, Run 0001 should continue to CH4 columns.
+        if run_i == 0:
+            return
 
+    # ------------------------------------------------------------------
+    # Compute CH4 column diagnostics for nonzero Jacobian runs
+    # ------------------------------------------------------------------
     sim_file_utc = os.path.join(
         Jacobian_RunDir,
         f"OutputDir/GEOSChem.SpeciesConc.{date_str}_0000z.nc4",
@@ -597,6 +672,15 @@ def process_run_day(
         Jacobian_RunDir,
         f"OutputDir/GEOSChem.SpeciesConc.{next_date_str}_0000z.nc4",
     )
+
+    output_fpath = os.path.join(
+        output_dir,
+        f"GEOSChem.CH4col.overpass.{date_str}_{overpass_tag}.nc4",
+    )
+
+    # Skip this run/day if CH4 column output already exists
+    if os.path.isfile(output_fpath):
+        return
 
     with ExitStack() as stack:
         sim_utc_ds = (
@@ -624,36 +708,20 @@ def process_run_day(
         )
 
         data_vars = {
-            f"{var}_col": (dims, overpass_all[i], {'units': 'mol/m2'})
+            f"{var}_col": (
+                dims,
+                overpass_all[i],
+                {"units": "mol/m2"},
+            )
             for i, var in enumerate(keepvars)
         }
+
         output_ds = xr.Dataset(data_vars, coords=coords)
 
-        output_ds[lat_name] = overpass_ds[lat_name]
-        output_ds[lon_name] = overpass_ds[lon_name]
+        output_ds = attach_overpass_grid_metadata(output_ds)
+        output_ds = add_common_attrs(output_ds)
 
-        if config['UseGCHP']:
-            output_ds['corner_lons'] = overpass_ds['corner_lons']
-            output_ds['corner_lats'] = overpass_ds['corner_lats']
-
-        output_dir = os.path.join(Jacobian_RunDir, "OverpassDiagnostics/")
-        os.makedirs(output_dir, exist_ok=True)
-
-        overpass_tag = OverpassTime.replace(":", "")
-        output_fpath = os.path.join(
-            output_dir,
-            f"GEOSChem.CH4col.overpass.{date_str}_{overpass_tag}.nc4",
-        )
-
-        output_ds.attrs["date_interpretation"] = (
-            "Filename date is local overpass date. Values are sampled only where "
-            "the corresponding UTC simulation date falls within [StartDate, EndDate). "
-            "Boundary cells outside the UTC window are NaN."
-        )
-        output_ds.attrs["utc_start_date"] = str(config["StartDate"])
-        output_ds.attrs["utc_end_date_exclusive"] = str(config["EndDate"])
-
-        output_ds.to_netcdf(output_fpath, mode='w')
+        output_ds.to_netcdf(output_fpath, mode="w")
 
 # ---------------------------------------------------------------------------
 # Main driver
@@ -679,7 +747,11 @@ def calculate_satellite_overpass_diagnostics(config, n_elements, n_workers=-1):
     """
     RunName    = config["RunName"]
     OutputPath = os.path.expandvars(config["OutputPath"])
-
+    DisableRun0000 = config.get("DisableRun0000", False)
+    if DisableRun0000:
+        start_run_num = 1
+    else:
+        start_run_num = 0
     JacobianRunDirs = os.path.join(OutputPath, f"{RunName}/jacobian_runs/")
     CSgridDir       = os.path.join(OutputPath, f"{RunName}/CS_grids/")
 
@@ -709,7 +781,7 @@ def calculate_satellite_overpass_diagnostics(config, n_elements, n_workers=-1):
     tmp_dir = tempfile.mkdtemp(prefix="overpass_met_")
     try:
         met_paths = presave_met_arrays(
-            date_list, start, end, JacobianRunDirs, RunName, tmp_dir,
+            date_list, start, end, JacobianRunDirs, RunName, tmp_dir, DisableRun0000
         )
 
         # ---- dispatch all (day, run) pairs in one parallel call ----
@@ -729,9 +801,10 @@ def calculate_satellite_overpass_diagnostics(config, n_elements, n_workers=-1):
                 coords,
                 lon_name,
                 lat_name,
+                DisableRun0000,
             )
             for date_str in date_list
-            for run_i in range(0, num_jacobian_runs)
+            for run_i in range(start_run_num, num_jacobian_runs)
         )
     finally:
         # clean up temporary memmap files

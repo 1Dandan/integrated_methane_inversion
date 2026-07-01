@@ -163,6 +163,7 @@ if __name__ == "__main__":
                     "build_jacobian": build_jacobian,
                     "period_i": period_i,
                     "use_water_obs": use_water_obs,
+                    "isPost": isPost.lower() == "true"
                 },
                 config,
             )
@@ -184,20 +185,18 @@ if __name__ == "__main__":
                 },
                 config,
             )
-
+            
             if output == None:
                 return 0
-        else:
-            return 0
-
-        if output["obs_GC"].shape[0] > 0:
             print("Saving .pkl file")
             save_obj(output, f"{outputdir}/{date}_GCtoTROPOMI.pkl")
             save_obj(viz_output, f"{vizdir}/{date}_GCtoTROPOMI.pkl")
-        
-        del output, viz_output
-        gc.collect()
-        return 0
+            
+            del output, viz_output
+            gc.collect()
+            return 0
+        else:
+            return 0
 
     results = Parallel(n_jobs=-1)(delayed(process)(filename) for filename in sat_files)
     print(f"Wrote files to {outputdir}")

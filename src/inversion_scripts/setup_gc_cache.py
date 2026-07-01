@@ -15,7 +15,8 @@ def setup_gc_cache(startday, endday, gc_source_path, gc_destination_path):
         endday              [str] : Last day of inversion period; formatted YYYYMMDD
         gc_source_path      [str] : GEOS-Chem output directory
         gc_destination_path [str] : Target GEOS-Chem data directory in inversion workspace
-
+        DisableRun0000      [bool]: If True, read BaseSpeciesConc collection from Run 0001; 
+                                    default is False, read SpeciesConc collection from Run 0000
     """
 
     # Make date range

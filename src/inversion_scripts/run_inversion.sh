@@ -47,16 +47,17 @@ nElements={STATE_VECTOR_ELEMENTS}
 nTracers={NUM_JACOBIAN_TRACERS}
 OutputPath={OUTPUT_PATH}
 Res={RES}
-JacobianRunsDir="${OutputPath}/${RunName}/jacobian_runs"
+RunDirs="${OutputPath}/${RunName}"
+JacobianRunsDir="${RunDirs}/jacobian_runs"
 PriorRunDir="${JacobianRunsDir}/${RunName}_0000"
 BackgroundRunDir="${JacobianRunsDir}/${RunName}_background"
-PosteriorRunDir="${OutputPath}/${RunName}/posterior_run"
+PosteriorRunDir="${RunDirs}/posterior_run"
 StateVectorFile={STATE_VECTOR_PATH}
 GCDir="./data_geoschem"
 GCVizDir="./data_geoschem_prior"
 JacobianDir="./data_converted"
 sensiCache="./data_sensitivities"
-tropomiCache="${OutputPath}/${RunName}/satellite_data"
+tropomiCache="${RunDirs}/satellite_data"
 period_i={PERIOD}
 
 # For Kalman filter: assume first inversion period (( period_i = 1 )) by default
@@ -82,51 +83,53 @@ fi
 #=======================================================================
 # Setup GC data directory in workdir
 #=======================================================================
+# When only archiving Jacobians for emission state vector elements, we do not need Run 0000
+#  and thus no need to setup_gc_cache from Run 0000
+DisableRun0000="${DisableRun0000:-false}"
+if ! "$DisableRun0000"; then
+    printf "Calling setup_gc_cache.py\n"
+    if "$LognormalErrors"; then
+        # for lognormal errors we use the clean background run
+        GCsourcepth="${BackgroundRunDir}/OutputDir"
+        PriorOutputDir="${PriorRunDir}/OutputDir"
+        # also need the prior cache so that we can visualize the prior simulation
+        python setup_gc_cache.py $StartDate $EndDate $PriorOutputDir $GCVizDir; wait
+    else
+        # for normal errors we use the prior run
+        GCsourcepth="${PriorRunDir}/OutputDir"
+    fi
 
-printf "Calling setup_gc_cache.py\n"
-if "$LognormalErrors"; then
-    # for lognormal errors we use the clean background run
-    GCsourcepth="${BackgroundRunDir}/OutputDir"
-    PriorOutputDir="${PriorRunDir}/OutputDir"
-    # also need the prior cache so that we can visualize the prior simulation
-    python setup_gc_cache.py $StartDate $EndDate $PriorOutputDir $GCVizDir; wait
-else
-    # for normal errors we use the prior run
-    GCsourcepth="${PriorRunDir}/OutputDir"
+    python setup_gc_cache.py $StartDate $EndDate $GCsourcepth $GCDir; wait
+    printf "DONE -- setup_gc_cache.py\n\n"
 fi
-
-python setup_gc_cache.py $StartDate $EndDate $GCsourcepth $GCDir; wait
-printf "DONE -- setup_gc_cache.py\n\n"
-
 #=======================================================================
 # Generate Jacobian matrix files 
 #=======================================================================
 
 printf "Calling jacobian.py\n"
 isPost="False"
-if ! "$PrecomputedJacobian"; then
+OnlyEmisPrecomputedK="${OnlyEmisPrecomputedK:-false}"
+RegridPrecomputedK="${RegridPrecomputedK:-false}"
+MultiPrecomputedJacobian="${MultiPrecomputedJacobian:-false}"
 
-    buildJacobian="True"
-    jacobian_sf="None"
-
-elif "$OnlyEmisPrecomputedK"; then
-    if [[ "$OptimizeOH" == "true" || "$OptimizeBCs" == "true" ]]; then
-        buildJacobian="True"
-    else
-        buildJacobian="False"
-    fi
-    jacobian_sf="None"
-
-elif "$MultiPrecomputedJacobian"; then
-
-    buildJacobian="False"
-    jacobian_sf="None"
-
+# Determine whether Jacobian scale factors are needed
+# MultiPrecomputedJacobian is a special case 
+#   where jacobian_sf is handled within regrid_precomputed_jacobian.py
+if [[ "$PrecomputedJacobian" == "true" && "$MultiPrecomputedJacobian" == "false" ]]; then
+    jacobian_sf="./jacobian_scale_factors.npy"
 else
+    jacobian_sf="None"
+fi
 
+# Determine whether to build new Jacobian sensitivities:
+#   we only need to build new Jacobians when there is no precomputed Jacobians or
+#   we only have precomputed Jacobians for emission elements but need to optimize BCs/OH
+if [[ "$PrecomputedJacobian" != "true" || \
+      ( "$OnlyEmisPrecomputedK" == "true" && \
+        ( "$OptimizeOH" == "true" || "$OptimizeBCs" == "true" ) ) ]]; then
+    buildJacobian="True"
+else
     buildJacobian="False"
-    jacobian_sf=./jacobian_scale_factors.npy
-
 fi
 
 python jacobian.py ${invPath}/${configFile} $StartDate $EndDate $LonMinInvDomain $LonMaxInvDomain $LatMinInvDomain $LatMaxInvDomain $nElements $tropomiCache $BlendedTROPOMI $UseWaterObs $isPost $period_i $buildJacobian False; wait
@@ -140,29 +143,32 @@ printf " DONE -- jacobian.py\n\n"
 #=======================================================================
 # Do inversion
 #=======================================================================
-if "$LognormalErrors"; then
-    # for lognormal errors we merge our y, y_bkgd and partial K matrices
-    python merge_partial_k.py $JacobianDir $StateVectorFile ${OutputPath}/${RunName}/config_${RunName}.yml $PrecomputedJacobian
+ArchiveJacobiansOnly="${ArchiveJacobiansOnly:-false}"
+if ! "$ArchiveJacobiansOnly"; then
+    if "$LognormalErrors"; then
+        # for lognormal errors we merge our y, y_bkgd and partial K matrices
+        python merge_partial_k.py $JacobianDir $StateVectorFile ${OutputPath}/${RunName}/config_${RunName}.yml $PrecomputedJacobian
 
-    # then we run the inversion
-    printf "Calling lognormal_invert.py\n"
-    python lognormal_invert.py ${OutputPath}/${RunName}/config_${RunName}.yml $StateVectorFile $jacobian_sf
-    printf "DONE -- lognormal_invert.py\n\n"
-else
-    posteriorSF="./inversion_result.nc"
-    python_args=(invert.py ${OutputPath}/${RunName}/config_${RunName}.yml $nElements $JacobianDir $posteriorSF $LonMinInvDomain $LonMaxInvDomain $LatMinInvDomain $LatMaxInvDomain $Res $jacobian_sf $StateVectorFile $period_i)
-    
-    printf "Calling invert.py\n"
-    python "${python_args[@]}"; wait
-    printf "DONE -- invert.py\n\n"
-    #=======================================================================
-    # Create gridded posterior scaling factor netcdf file
-    #=======================================================================
-    GriddedPosterior="./gridded_posterior.nc"
+        # then we run the inversion
+        printf "Calling lognormal_invert.py\n"
+        python lognormal_invert.py ${OutputPath}/${RunName}/config_${RunName}.yml $StateVectorFile $jacobian_sf
+        printf "DONE -- lognormal_invert.py\n\n"
+    else
+        posteriorSF="./inversion_result.nc"
+        python_args=(invert.py ${OutputPath}/${RunName}/config_${RunName}.yml $nElements $JacobianDir $posteriorSF $LonMinInvDomain $LonMaxInvDomain $LatMinInvDomain $LatMaxInvDomain $Res $jacobian_sf $StateVectorFile $period_i)
+        
+        printf "Calling invert.py\n"
+        python "${python_args[@]}"; wait
+        printf "DONE -- invert.py\n\n"
+        #=======================================================================
+        # Create gridded posterior scaling factor netcdf file
+        #=======================================================================
+        GriddedPosterior="./gridded_posterior.nc"
 
-    printf "Calling make_gridded_posterior.py\n"
-    python make_gridded_posterior.py $posteriorSF $StateVectorFile $GriddedPosterior; wait
-    printf "DONE -- make_gridded_posterior.py\n\n"
+        printf "Calling make_gridded_posterior.py\n"
+        python make_gridded_posterior.py $posteriorSF $StateVectorFile $GriddedPosterior; wait
+        printf "DONE -- make_gridded_posterior.py\n\n"
+    fi
 fi
 
 exit 0

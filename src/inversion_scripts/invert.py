@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+import os
 import glob
 import yaml
 import re
@@ -101,9 +102,10 @@ def do_inversion(
     xlim = [lon_min + degx, lon_max - degx]
     ylim = [lat_min + degy, lat_max - degy]
 
-    # get prior emissions, destination area in square radians and all reference directories if using precomputed Jacobian
+    # Special case for multi precomputed K:
+    #   get prior emissions, destination area in square radians and all reference directories if using precomputed Jacobian
     if config['PrecomputedJacobian']:
-        if (config['MultiPrecomputedJacobian']) and (config['OnlyEmisPrecomputedK']):
+        if (config['MultiPrecomputedJacobian']):
             # prior_ds of the destination grid
             RunDirs=f"{os.path.expandvars(config['OutputPath']) }/{config['RunName']}"
             
@@ -262,69 +264,113 @@ def do_inversion(
         obs_error = [obs if obs > 0 else 1 for obs in obs_error]
 
         # Jacobian entries for observations within bounds [ppb]
-        if config['PrecomputedJacobian']:
-            if (config['MultiPrecomputedJacobian']) and (config['OnlyEmisPrecomputedK']):
-                # regrid Jacobian row (super observations) first, 
-                # and then regrid Jacobian column (state vector)
-                
-                # regrid jacobian row
-                jacobian_RegridRow = []
-                overlap_area_jacobian_ratio_src = []
-                overlap_area_src = []
-                for ti in range(num_ref_dir):
-                    # Sanity check:
-                    # reference directory naming is 1-based
-                    ref_RunName = f"{ref_dir_prename}{target_face[ti]+1:03d}"
-                    ref_dir = os.path.join(ref_parent_dir, ref_RunName)
-                    ref_config_path = os.path.join(ref_dir, f"config_{ref_RunName}.yml")
-                    ref_config = yaml.load(open(ref_config_path), Loader=yaml.FullLoader)
-                    assert (
-                        np.isclose(ref_sv_ds['TARGET_LAT'].values[ti], ref_config['TARGET_LAT']) and
-                        np.isclose(ref_sv_ds['TARGET_LON'].values[ti], ref_config['TARGET_LON'])
-                    ), \
-                        f"The TARGET_LAT/LON in the reference directory is not consistent with the reference config \
-                        for {ref_RunName} with target_face id of {target_face[ti]+1} \
-                        (TARGET_LAT: {ref_sv_ds['TARGET_LAT'].values[ti]:.2f} vs. {ref_config['TARGET_LAT']:.2f}, \
-                        TARGET_LON: {ref_sv_ds['TARGET_LON'].values[ti]:.2f} vs. {ref_config['TARGET_LON']:.2f})"
-                    
-                    jacobian_ref_path = os.path.join(ref_dir, "inversion", "data_converted", os.path.basename(fi))
+        if config["PrecomputedJacobian"]:
+            if config.get("OnlyEmisPrecomputedK", False):
+                if config.get('RegridPrecomputedK', False):
+                    if config.get('MultiPrecomputedJacobian', False):
+                        # regrid Jacobian row (super observations) first, 
+                        # and then regrid Jacobian column (state vector)
+                        
+                        # regrid jacobian row
+                        jacobian_RegridRow = []
+                        overlap_area_jacobian_ratio_src = []
+                        overlap_area_src = []
+                        for ti in range(num_ref_dir):
+                            # Sanity check:
+                            # reference directory naming is 1-based
+                            ref_RunName = f"{ref_dir_prename}{target_face[ti]+1:03d}"
+                            ref_dir = os.path.join(ref_parent_dir, ref_RunName)
+                            ref_config_path = os.path.join(ref_dir, f"config_{ref_RunName}.yml")
+                            ref_config = yaml.load(open(ref_config_path), Loader=yaml.FullLoader)
+                            assert (
+                                np.isclose(ref_sv_ds['TARGET_LAT'].values[ti], ref_config['TARGET_LAT']) and
+                                np.isclose(ref_sv_ds['TARGET_LON'].values[ti], ref_config['TARGET_LON'])
+                            ), \
+                                f"The TARGET_LAT/LON in the reference directory is not consistent with the reference config \
+                                for {ref_RunName} with target_face id of {target_face[ti]+1} \
+                                (TARGET_LAT: {ref_sv_ds['TARGET_LAT'].values[ti]:.2f} vs. {ref_config['TARGET_LAT']:.2f}, \
+                                TARGET_LON: {ref_sv_ds['TARGET_LON'].values[ti]:.2f} vs. {ref_config['TARGET_LON']:.2f})"
+                            
+                            jacobian_ref_path = os.path.join(ref_dir, "inversion", "data_converted", os.path.basename(fi))
+                            jacobian_ref_dat = load_obj(jacobian_ref_path)
+                            
+                            # assume the reference Jacobian is global
+                            assert not (ref_config['OptimizeBCs'] or ref_config['isRegional']), \
+                                "The reference precomputed Jacobian (stretched GCHP with ensemble target faces) \
+                                    must be global (not BC-optimized or regional)"
+                            # regrid jacobian row
+                            if (ref_config['OptimizeOH']):
+                                # discard Jacobian column(s) for optimizing OH
+                                jacobian_ref = jacobian_ref_dat["K"][:,:-2]
+                            else:
+                                jacobian_ref = jacobian_ref_dat["K"]
+                            ref_GC_index = jacobian_ref_dat["GC_index"]
+                            # GC_index is already subsetted to the region and 
+                            # thus later for K_emis, we do not need to use [ind,:] to subset anymore
+                            jacobian_regridding_weights_row = get_regrid_weights_jacobian_row(config, RunDirs, GC_index, ref_config, ref_GC_index)
+                            jacobian_RegridRow_temp = jacobian_regridding_weights_row.dot(jacobian_ref).astype('float32')
+                            jacobian_RegridRow.append(jacobian_RegridRow_temp)
+                            # get inputs needed for regridding jacobian col
+                            overlap_area_jacobian_ratio_src_temp, overlap_area_src_temp = get_regrid_weights_jacobian_col(config, RunDirs, ref_config, ref_dir, ref_prior_emis_sv[ti])
+                            overlap_area_src.append(overlap_area_src_temp)
+                            overlap_area_jacobian_ratio_src.append(overlap_area_jacobian_ratio_src_temp)
+
+                        # dense matrix in shape of (n_dst_valid_superobs, n_ref_sv_total)
+                        jacobian_RegridRow = np.concatenate(jacobian_RegridRow, axis=1)
+                        # sparse matrix in shape of (n_dst_sv, n_ref_sv_total)
+                        overlap_area_jacobian_ratio_src = hstack(overlap_area_jacobian_ratio_src, format="csr")
+                        # sparse matrix in shape of (n_dst_sv, n_ref_sv_total)
+                        overlap_area_src = hstack(overlap_area_src, format="csr")
+
+                        # regrid jacobian column
+                        # the jacoban is reconciled by the jacobian ratio and then 
+                        # get the area-weighted mean over reference state vector elements that overlap with the destination state vector
+                        # regrid_jacobian_row_col = sum ( jacobian_RegridRow * overlap_area_jacobian_ratio_src ) / sum(overlap_area_src)
+                        K_emis = 1e9 * regrid_jacobian_row_col(
+                            jacobian_RegridRow, overlap_area_jacobian_ratio_src, overlap_area_src, RunDirs, config, prior_emis
+                        )
+                else:
+                    # if no regridding needed but only supply K for emission state vector elements,
+                    #    read the reference precomputed Jacobian for emission elements and potentially apply jacobian_sf
+                    jacobian_ref_path = fi.replace("data_converted", "data_converted_reference")
                     jacobian_ref_dat = load_obj(jacobian_ref_path)
+                    # get ref_config
+                    ref_config_matches = sorted(
+                        glob.glob(os.path.join(config["ReferenceRunDir"], "config_*.yml"))
+                    )
+                    if len(ref_config_matches) != 1:
+                        raise ValueError(
+                            f"Expected exactly one config_*.yml file under "
+                            f"{config['ReferenceRunDir']}, but found {len(ref_config_matches)}: "
+                            f"{ref_config_matches}"
+                        )
+                    ref_config_fpath = ref_config_matches[0]
+                    ref_config = yaml.load(open(ref_config_fpath), Loader=yaml.FullLoader)
                     
-                    # assume the reference Jacobian is global
-                    assert not (ref_config['OptimizeBCs'] or ref_config['isRegional']), \
-                        "The reference precomputed Jacobian (stretched GCHP with ensemble target faces) \
-                            must be global (not BC-optimized or regional)"
-                    # regrid jacobian row
-                    if (ref_config['OptimizeOH']):
+                    jacobian_ref = jacobian_ref_dat["K"]
+                    if ref_config["OptimizeOH"]:
                         # discard Jacobian column(s) for optimizing OH
-                        jacobian_ref = jacobian_ref_dat["K"][:,:-2]
-                    else:
-                        jacobian_ref = jacobian_ref_dat["K"]
-                    ref_GC_index = jacobian_ref_dat["GC_index"]
-                    # GC_index is already subsetted to the region and 
-                    # thus later for K_emis, we do not need to use [ind,:] to subset anymore
-                    jacobian_regridding_weights_row = get_regrid_weights_jacobian_row(config, RunDirs, GC_index, ref_config, ref_GC_index)
-                    jacobian_RegridRow_temp = jacobian_regridding_weights_row.dot(jacobian_ref).astype('float32')
-                    jacobian_RegridRow.append(jacobian_RegridRow_temp)
-                    # get inputs needed for regridding jacobian col
-                    overlap_area_jacobian_ratio_src_temp, overlap_area_src_temp = get_regrid_weights_jacobian_col(config, RunDirs, ref_config, ref_dir, ref_prior_emis_sv[ti])
-                    overlap_area_src.append(overlap_area_src_temp)
-                    overlap_area_jacobian_ratio_src.append(overlap_area_jacobian_ratio_src_temp)
+                        if ref_config["isRegional"]:
+                            jacobian_ref = jacobian_ref[:, :-1]
+                        else:
+                            jacobian_ref = jacobian_ref[:, :-2]
 
-                # dense matrix in shape of (n_dst_valid_superobs, n_ref_sv_total)
-                jacobian_RegridRow = np.concatenate(jacobian_RegridRow, axis=1)
-                # sparse matrix in shape of (n_dst_sv, n_ref_sv_total)
-                overlap_area_jacobian_ratio_src = hstack(overlap_area_jacobian_ratio_src, format="csr")
-                # sparse matrix in shape of (n_dst_sv, n_ref_sv_total)
-                overlap_area_src = hstack(overlap_area_src, format="csr")
+                    if ref_config["OptimizeBCs"]:
+                        # BC optimization should only happen for regional inversions
+                        if not ref_config["isRegional"]:
+                            raise ValueError(
+                                "ref_config['OptimizeBC'] is True, but ref_config['isRegional'] is False. "
+                                "BC optimization is expected only for regional inversions."
+                            )
 
-                # regrid jacobian column
-                # the jacoban is reconciled by the jacobian ratio and then 
-                # get the area-weighted mean over reference state vector elements that overlap with the destination state vector
-                # regrid_jacobian_row_col = sum ( jacobian_RegridRow * overlap_area_jacobian_ratio_src ) / sum(overlap_area_src)
-                K_emis = 1e9 * regrid_jacobian_row_col(
-                    jacobian_RegridRow, overlap_area_jacobian_ratio_src, overlap_area_src, RunDirs, config, prior_emis
-                )
+                        # discard Jacobian columns for optimizing BCs
+                        jacobian_ref = jacobian_ref[:, :-4]
+                    K_emis = 1e9 * jacobian_ref # (n_obs, n_sv_emis)
+                    
+                    # Apply scaling matrix if using precomputed Jacobian
+                    scale_factors = np.load(jacobian_sf) # (n_sv_emis,)
+                    
+                    K_emis = (K_emis * scale_factors[None, :])[ind, :]
 
                 if config["OptimizeBCs"] or config["OptimizeOH"]:
                     K_noemis = 1e9 * dat["K_noEmis"][ind, :]

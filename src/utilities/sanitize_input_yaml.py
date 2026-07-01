@@ -1,5 +1,6 @@
 import sys
 import yaml
+import warnings
 
 """
 A simple utility script that tests whether all required IMI variables are present 
@@ -153,10 +154,13 @@ def raise_error_message(var):
 
 if __name__ == "__main__":
     config_path = sys.argv[1]
-    config = yaml.load(open(config_path), Loader=yaml.FullLoader)
+
+    with open(config_path) as f:
+        config = yaml.load(f, Loader=yaml.FullLoader)
+
     inputted_config = config.keys()
 
-    # require additional variables if conditional dict key is set to true
+    # Require additional variables if conditional dict key is set to true
     for key in conditional_dict.keys():
         if key not in inputted_config:
             raise_error_message(key)
@@ -164,8 +168,39 @@ if __name__ == "__main__":
             config_required = config_required + conditional_dict[key]
 
     missing_input_vars = [x for x in config_required if x not in inputted_config]
-    for var in missing_input_vars:
-        raise_error_message(var)
 
     if len(missing_input_vars) > 0:
+        for var in missing_input_vars:
+            raise_error_message(var)
         sys.exit(1)
+
+    # ---------------------------------------------------------------------
+    # Consistency checks
+    # ---------------------------------------------------------------------
+    DisableRun0000 = config.get("DisableRun0000", False)
+    OptimizeOH = config.get("OptimizeOH", False)
+    ArchiveJacobiansOnly = config.get("ArchiveJacobiansOnly", False)
+
+    if OptimizeOH and DisableRun0000:
+        raise ValueError(
+            "Error: OptimizeOH and DisableRun0000 cannot both be true. "
+            "Run0000 is required when OptimizeOH is true because the base run "
+            "is needed for OH optimization."
+        )
+
+    if DisableRun0000:
+        warnings.warn(
+            "Warning: DisableRun0000 is set to true. Run0000 will not be performed, "
+            "so virtual satellite columns with prior emissions cannot be calculated. "
+            "DisableRun0000 should only be set to true if you only want to calculate "
+            "Jacobian sensitivities.",
+            UserWarning,
+        )
+    
+    if ArchiveJacobiansOnly:
+        warnings.warn(
+            "Warning: ArchiveJacobiansOnly is set to true. invert.py to calculate posterior flux will not be performed, "
+            "ArchiveJacobiansOnly should only be set to true (often with DisableRun0000 turned on as well) if you only want to calculate "
+            "Jacobian sensitivities.",
+            UserWarning,
+        )

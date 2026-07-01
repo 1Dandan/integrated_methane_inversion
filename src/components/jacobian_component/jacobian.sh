@@ -79,10 +79,12 @@ setup_jacobian() {
         nRuns=0
     fi
     
-    # Always create the base run: x=0
-    x=0
-    xstr="0000"
-    create_simulation_dir
+    if ! "$DisableRun0000"; then
+        # Always create the base run: x=0
+        x=0
+        xstr="0000"
+        create_simulation_dir
+    fi
 
     # Initialize (x=0 is base run, i.e. no perturbation; x=1 is state vector element=1; etc.)
     x=1
@@ -104,7 +106,12 @@ setup_jacobian() {
     else
         cp ${InversionPath}/src/geoschem_run_scripts/submit_jacobian_simulations_array.sh jacobian_runs/
     fi
-    sed -i -e "s:{START}:0:g" \
+    if "$DisableRun0000"; then
+        start_run_num=1
+    else
+        start_run_num=0
+    fi
+    sed -i -e "s:{START}:${start_run_num}:g" \
         -e "s:{END}:${nRuns}:g" \
         -e "s:{InversionPath}:${InversionPath}:g" \
         -e "s:{RunDirs}:${RunDirs}:g" jacobian_runs/submit_jacobian_simulations_array.sh
@@ -467,7 +474,8 @@ create_simulation_dir() {
     
     if is_number "$x"; then
         if [ $x -gt 0 ] && [ "$BC_elem" = false ] && [ "$OH_elem" = false ]; then
-            # special case for adding one more bc_base run
+            # Skip tracer-adding logic only for the special case: x=1 with precomputed
+            # Jacobian and emission-only K (no extra Jacobian tracers needed there)
             if ! [[ $x -eq 1 && \
                 "$PrecomputedJacobian" == "true" && \
                 "$OnlyEmisPrecomputedK" == "true" ]]; then
@@ -494,6 +502,23 @@ create_simulation_dir() {
                     if [ "$x" -gt 1 ]; then
                         perl -0777 -i -pe "s/'SpeciesConcVV_CH4\s*',\s*'GCHPchem',\s*\n\s*('SpeciesConcVV_CH4_jac\d{4}',\s*'GCHPchem',)/\1/" HISTORY.rc
                     fi
+                fi
+            fi
+
+            if [[ "${DisableRun0000:-false}" == "true" && $x -eq 1 ]]; then
+                ScriptPath="${InversionPath}/src/utilities/add_base_speciesconc_collection.sh"
+                chmod +x "$ScriptPath"
+                "$ScriptPath" HISTORY.rc
+
+                # turn on StateMetLevEdge in Run0001 as well when 0000 is disabled
+                if "$UseGCHP"; then
+                    sed -i -e 's/#'\''StateMetLevEdge/'\''StateMetLevEdge/g' \
+                        -e 's/StateMetLevEdge.frequency:.*/StateMetLevEdge.frequency:      010000/g' \
+                        -e 's/StateMetLevEdge.duration:.*/StateMetLevEdge.duration:       240000/g' HISTORY.rc
+                else
+                    sed -i -e 's/#'\''StateMetLevEdge/'\''StateMetLevEdge/g' \
+                        -e 's/StateMetLevEdge.frequency:   00000100 000000/StateMetLevEdge.frequency:   00000000 010000/g' \
+                        -e 's/StateMetLevEdge.duration:    00000100 000000/StateMetLevEdge.duration:    00000001 000000/g' HISTORY.rc
                 fi
             fi
         fi
@@ -633,19 +658,6 @@ run_jacobian() {
         jacobian_end=$(date +%s)
     else
         set +e
-        # Add symlink pointing to jacobian matrix files from the reference
-        # inversion w/ precomputed Jacobian
-        if "$KalmanMode"; then
-            cd ${RunDirs}/kf_inversions/period${period_i}
-            precomputedJacobianCachePrefix=${ReferenceRunDir}/kf_inversions/period${period_i}
-        else
-            cd ${RunDirs}/inversion
-            precomputedJacobianCachePrefix=${ReferenceRunDir}/inversion
-        fi
-
-        precomputedJacobianCache=${precomputedJacobianCachePrefix}/data_converted
-        ln -nsf $precomputedJacobianCache data_converted_reference
-
         # Run the prior simulation
         JacobianRunsDir=${RunDirs}/jacobian_runs
         cd ${JacobianRunsDir}
@@ -710,6 +722,25 @@ run_jacobian() {
             [ ! -f ".error_status_file.txt" ] || imi_failed $LINENO
             printf "=== DONE BACKGROUND SIMULATION ===\n"
         fi
+    fi
+
+    # set data_converted_reference and get Jacobian scale factors
+    #   when PrecomputedJacobian is true but not with MultiPrecomputedJacobian on.
+    #   MultiPrecomputedJacobian is a special case, where there are multiple inversion dirs as the reference
+    if [[ "$PrecomputedJacobian" == "true" && \
+        "$MultiPrecomputedJacobian" == "false" ]]; then
+        # Add symlink pointing to jacobian matrix files from the reference
+        # inversion w/ precomputed Jacobian
+        if "$KalmanMode"; then
+            cd ${RunDirs}/kf_inversions/period${period_i}
+            precomputedJacobianCachePrefix=${ReferenceRunDir}/kf_inversions/period${period_i}
+        else
+            cd ${RunDirs}/inversion
+            precomputedJacobianCachePrefix=${ReferenceRunDir}/inversion
+        fi
+
+        precomputedJacobianCache=${precomputedJacobianCachePrefix}/data_converted
+        ln -nsf $precomputedJacobianCache data_converted_reference
 
         # Get Jacobian scale factors
         python ${InversionPath}/src/inversion_scripts/get_jacobian_scalefactors.py $jacobian_period $RunDirs $ReferenceRunDir $KalmanMode
