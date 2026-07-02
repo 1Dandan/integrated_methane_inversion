@@ -304,6 +304,10 @@ setup_imi() {
         setup_template
     fi
 
+    if ("$SetupHemcoPriorEmisRunDir" && "$UseGCHP"); then
+        setup_prior_gchp
+    fi
+
     ##=======================================================================
     ## Generate Prior Emissions using a HEMCO standalone run or GCHP prior run
     ##=======================================================================
@@ -311,9 +315,11 @@ setup_imi() {
         if [ "$UseGCHP" != "true" ]; then
             run_hemco_prior_emis
         else
-            setup_prior_gchp
             run_prior_gchp $StartDate $EndDate
         fi
+    elif "$RegridHemcoPriorEmis"; then
+        scriptfpath="${InversionPath}/src/components/hemco_prior_emis_component/regrid_c360_prior_emis_to_C36S10.py"
+        python $scriptfpath ${InversionPath}/${ConfigFile}
     fi
 
     ##=======================================================================

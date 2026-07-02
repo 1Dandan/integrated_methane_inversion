@@ -33,6 +33,41 @@ warnings.filterwarnings(
 MwAir = 28.97  # g/mol
 
 
+def output_file_is_complete(fpath):
+    """Return True only if `fpath` exists AND holds valid data.
+
+    A file counts as complete when it opens as a NetCDF dataset and a data
+    variable whose name contains 'SpeciesConcVV_CH4' or 'Met_' is (a) a
+    floating-point array and (b) entirely finite (no NaN, no inf). Checking a
+    single such variable is enough, since all variables in a file are written
+    together. A missing, unreadable, non-float, or NaN-containing file is
+    treated as incomplete so it gets rewritten.
+    """
+    if not os.path.isfile(fpath):
+        return False
+
+    try:
+        with xr.open_dataset(fpath) as ds:
+            check_var = next(
+                (v for v in ds.data_vars
+                 if "SpeciesConcVV_CH4" in v or "Met_" in v),
+                None,
+            )
+            if check_var is None:
+                return False
+
+            da = ds[check_var]
+
+            # Must be floating-point simulation data
+            if not np.issubdtype(da.dtype, np.floating):
+                return False
+
+            # Every value must be finite (rejects NaN and inf)
+            return bool(np.isfinite(da).all())
+    except Exception:
+        # Corrupt or partially written file -> reprocess
+        return False
+    
 # ---------------------------------------------------------------------------
 # Helper: build date list
 # ---------------------------------------------------------------------------
@@ -636,8 +671,8 @@ def process_run_day(
                 f"{file_prefix}.overpass.{date_str}_{overpass_tag}.nc4",
             )
 
-            # Skip this file if it already exists
-            if os.path.isfile(output_fpath):
+            # Skip this file if it already exists and is complete
+            if output_file_is_complete(output_fpath):
                 continue
 
             output_ds = sample_baserun_file_type(
@@ -678,8 +713,8 @@ def process_run_day(
         f"GEOSChem.CH4col.overpass.{date_str}_{overpass_tag}.nc4",
     )
 
-    # Skip this run/day if CH4 column output already exists
-    if os.path.isfile(output_fpath):
+    # Skip this file if it already exists and is complete
+    if output_file_is_complete(output_fpath):
         return
 
     with ExitStack() as stack:

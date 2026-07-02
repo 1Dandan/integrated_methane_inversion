@@ -122,7 +122,8 @@ conditional_dict["UseGCHP"] = [
     "CS_RES",
     "TOTAL_CORES",
     "NUM_NODES",
-    "NUM_CORES_PER_NODE"
+    "NUM_CORES_PER_NODE",
+    "SetupHemcoPriorEmisRunDir"
 ]
 conditional_dict["STRETCH_GRID"] = [
     "STRETCH_FACTOR",
@@ -137,7 +138,9 @@ conditional_dict["SatelliteDiagnostics"] = [
     "DoSatelliteDiagnostics", # to calculate satellite diagnostics or not from Jacobian runs
     "SatDiagOperator", # to use the processed satellite diagnostics or not when calculating Jacobians
 ]
-
+conditional_dict["RegridHemcoPriorEmis"] = [
+    "ReferencePriorEmisDir",
+]
 def raise_error_message(var):
     """
     Description: raise an error message about missing config variable

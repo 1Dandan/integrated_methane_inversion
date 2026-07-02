@@ -152,6 +152,9 @@ Met: "GEOSFP"
 ##   Turn on/off different steps in setting up the inversion
 RunSetup: true
 SetupTemplateRundir: true
+# add option to setup HemcoPriorEmis run directory when UseGCHP is true,
+#  so that we can separate set-up with running the dir
+SetupHemcoPriorEmisRunDir: true
 SetupSpinupRun: false
 SetupJacobianRuns: false
 SetupInversion: false
@@ -164,6 +167,11 @@ DisableRun0000: false
 ## Run modules
 ##   Turn on/off different steps in performing the inversion
 DoHemcoPriorEmis: true
+# add option to regrid the reference HemcoPriorEmis file to the current GCHP grid,
+#  which is exclusive with DoHemcoPriorEmis, default to false
+RegridHemcoPriorEmis: false
+# regrid reference HemcoPriorEmis (assumed to be on C360 grid) to the current GCHP grid (e.g., C36S10)
+ReferencePriorEmisDir: "/path/to/C360/hemco_prior_emis/OutputDir"
 DoSpinup: false
 DoJacobian: false
 ReDoJacobian: false
