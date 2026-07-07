@@ -103,7 +103,13 @@ initial_restart=./Restarts/GEOSChem.Restart.${START_DATE:0:8}_0000z.c${N}.nc4
 if [ ! -f $initial_restart ]; then
     echo "ERROR: inital restart file of ${initial_restart} does not exist! Set a soft link for your initial restart file." >> $log
 fi
-
+# remove the initial checkpoint file if it exists
+#  as it will always be created at the start (when Checkpoint_Freq=HHMMSS) but cannot be overwritted 
+#     and thus will cause running error
+initial_checkpoint=./Restarts/gcchem_internal_checkpoint.${START_DATE:0:8}_0000z.nc4
+if [ -f $initial_checkpoint ]; then
+    rm -f $initial_checkpoint
+fi
 if has_checkpoint; then
     RESTART_FILE=$(last_checkpoint)
     RESTART_DATE=$(last_checkpoint_datetime)
