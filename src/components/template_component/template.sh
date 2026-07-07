@@ -104,8 +104,8 @@ setup_template() {
             -e 's/^AutoUpdate_Diagnostics=.*$/AutoUpdate_Diagnostics=OFF/' \
             setCommonRunSettings.sh
         # turn on monthly checkpoint
-        sed -i -e 's/^Midrun_Checkpoint=OFF/Midrun_Checkpoint=ON/' \
-            -e 's/^Checkpoint_Freq=.*/Checkpoint_Freq=monthly/' \
+        sed -i -e "s/^Midrun_Checkpoint=OFF/Midrun_Checkpoint=ON/" \
+            -e "s/^Checkpoint_Freq=.*/Checkpoint_Freq=${Checkpoint_Freq}/" \
             setCommonRunSettings.sh
         sed -i -e "s/monthly:[[:space:]]*1/monthly:        0/g" HISTORY.rc
         if "$STRETCH_GRID"; then

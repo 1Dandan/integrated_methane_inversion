@@ -28,6 +28,7 @@ NUM_CORES_PER_NODE: 36
 StartDate: 20180501
 EndDate: 20180502
 SpinupMonths: 1
+Checkpoint_Freq: "2400000" # 10-day
 
 ## Use blended TROPOMI+GOSAT data (true)? Or use operational TROPOMI data (false)?
 BlendedTROPOMI: true

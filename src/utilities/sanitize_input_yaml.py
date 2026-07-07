@@ -123,6 +123,7 @@ conditional_dict["UseGCHP"] = [
     "TOTAL_CORES",
     "NUM_NODES",
     "NUM_CORES_PER_NODE",
+    "Checkpoint_Freq",
     "SetupHemcoPriorEmisRunDir"
 ]
 conditional_dict["STRETCH_GRID"] = [
