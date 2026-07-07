@@ -31,6 +31,14 @@ function last_checkpoint_datetime() {
     last_checkpoint | sed 's/\.\/Restarts\/gcchem_internal_checkpoint.\([1-9][0-9][0-9][0-9][0-9][0-9][0123][0-9]\)_\([0-9][0-9]00\).*/\1 \200/'
 }
 
+# Keep only the two most recent internal checkpoints; delete older ones
+function prune_checkpoints() {
+    local keep=2
+    ls -1 ./Restarts/gcchem_internal_checkpoint*.nc4 2>/dev/null \
+        | head -n -${keep} \
+        | xargs -r rm -f
+}
+
 # Calculate RunDuration (YYYYMMDD) between two dates (YYYYMMDD)
 function get_run_duration() {
   local start_date=$1
@@ -118,6 +126,8 @@ if has_checkpoint; then
     RunDuration=$(get_run_duration "${RESTART_DATE:0:8}" "${END_DATE:0:8}")
     sed -i -e "s/Run_Duration=\"[0-9]\{8\} 000000\"/Run_Duration=\"${RunDuration} 000000\"/" \
             setCommonRunSettings.sh
+    # Prune old internal checkpoints, keeping the two most recent as backup
+    prune_checkpoints
     ln -nsf ${RESTART_FILE} gchp_restart.nc4
 else
     ./setCommonRunSettings.sh
