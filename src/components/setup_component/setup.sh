@@ -257,7 +257,11 @@ setup_imi() {
     else
         # Copy custom state vector to $RunDirs directory for later use
         printf "\nCopying state vector file\n"
-        cp -v $StateVectorFile ${RunDirs}/StateVector.nc
+        if [ "$StateVectorFile" -ef "${RunDirs}/StateVector.nc" ]; then
+            printf "State vector file is already in place; skipping copy\n"
+        else
+            cp -v "$StateVectorFile" "${RunDirs}/StateVector.nc"
+        fi
     fi
 
     # Determine number of elements in state vector file

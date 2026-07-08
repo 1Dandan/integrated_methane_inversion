@@ -277,7 +277,6 @@ run_posterior() {
     GCDir="./data_geoschem_posterior"
     printf "\n=== Calling setup_gc_cache.py for posterior ===\n"
     python ${InversionPath}/src/inversion_scripts/setup_gc_cache.py $StartDate_i $EndDate_i $GCsourcepth $GCDir
-    wait
     printf "\n=== DONE -- setup_gc_cache.py ===\n"
 
     # Sample GEOS-Chem atmosphere with TROPOMI
@@ -307,7 +306,6 @@ run_posterior() {
 
     printf "\n=== Calling jacobian.py to sample posterior simulation (without jacobian sensitivity analysis) ===\n"
     python ${InversionPath}/src/inversion_scripts/jacobian.py ${ConfigPath} $StartDate_i $EndDate_i $LonMinInvDomain $LonMaxInvDomain $LatMinInvDomain $LatMaxInvDomain $nElements $tropomiCache $BlendedTROPOMI $UseWaterObs $isPost $kf_period $buildJacobian False
-    wait
     printf "\n=== DONE sampling the posterior simulation ===\n\n"
     posterior_end=$(date +%s)
 

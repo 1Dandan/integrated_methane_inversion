@@ -1,4 +1,5 @@
-import os
+import os, sys, signal
+import subprocess
 import pickle
 from datetime import datetime, timedelta
 import numpy as np
@@ -17,6 +18,28 @@ from src.inversion_scripts.classify_TROPOMI_obs_to_CSgrids import(
     latlon_to_cartesian,
     build_kdtree,
 )
+
+def clean_exit(code=0):
+    """Flush, reap lingering loky children, then exit this process only.
+    Does NOT touch the parent shell / Slurm job."""
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    mypid = os.getpid()
+    # kill only our own child processes (loky workers + resource_tracker)
+    try:
+        out = subprocess.run(
+            ["pgrep", "-P", str(mypid)], capture_output=True, text=True
+        )
+        for pid in out.stdout.split():
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+    except Exception:
+        pass
+
+    os._exit(code)
 
 def save_obj(obj, name):
     """Save something with Pickle."""

@@ -289,7 +289,18 @@ setup_template() {
     upper=$(( (NumJacobianTracers + 9) / 10 * 10 ))
 
     cd "${build_dir}"
-    cmake . -DMECH=carbon -DJACOBIAN=y >> build_geoschem.log 2>&1
+    # Only reconfigure if at least one executable is missing
+    need_build=false
+    for n in $(seq 10 10 $upper); do
+        if [ ! -f "bin/${execname}.${n}" ]; then
+            need_build=true
+            break
+        fi
+    done
+
+    if [ "$need_build" = true ]; then
+        cmake . -DMECH=carbon -DJACOBIAN=y >> build_geoschem.log 2>&1
+    fi
     for n in $(seq 10 10 $upper); do
         if [ -f "bin/${execname}.${n}" ]; then
             echo "Executable bin/${execname}.${n} already exists — skipping rebuild."

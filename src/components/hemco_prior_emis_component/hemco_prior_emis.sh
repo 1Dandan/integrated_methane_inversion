@@ -347,11 +347,10 @@ run_prior_gchp() {
     for file in GEOSChem.Emissions*.nc4; do
         exclude_soil_sink $file $file
     done
-    set +e
-
+    
     # Navigate back to top-level directory
     cd ${RunDirs}
 
     printf "\n=== DONE GCHP Prior SIMULATION ===\n"
-    spinup_end=$(date +%s)
+    prior_end=$(date +%s)
 }

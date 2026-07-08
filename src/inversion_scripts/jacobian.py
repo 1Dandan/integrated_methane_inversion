@@ -9,7 +9,10 @@ import os
 import datetime
 import yaml
 import gc
-from src.inversion_scripts.utils import save_obj
+from src.inversion_scripts.utils import (
+    save_obj,
+    clean_exit,
+)
 from src.inversion_scripts.operators.TROPOMI_operator import (
     apply_average_tropomi_operator,
     apply_tropomi_operator,
@@ -68,7 +71,7 @@ def apply_operator(operator, params, config):
 
 
 if __name__ == "__main__":
-
+    
     config = yaml.load(open(sys.argv[1]), Loader=yaml.FullLoader)
     startday = sys.argv[2]
     endday = sys.argv[3]
@@ -200,3 +203,5 @@ if __name__ == "__main__":
 
     results = Parallel(n_jobs=-1)(delayed(process)(filename) for filename in sat_files)
     print(f"Wrote files to {outputdir}")
+
+    clean_exit()
