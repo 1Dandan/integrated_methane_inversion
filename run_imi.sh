@@ -28,11 +28,6 @@ source src/components/kalman_component/kalman.sh
 start_time=$(date)
 setup_start=$(date +%s)
 
-# --- environment fixes for AWS/Lustre/conda ---
-export HDF5_USE_FILE_LOCKING=FALSE
-export OMP_NUM_THREADS=1
-export PYTHONUNBUFFERED=1
-
 ##=======================================================================
 ## Parse config.yml file
 ##=======================================================================
@@ -183,7 +178,6 @@ if [[ -z "$DataPathTROPOMI" ]]; then
         -p $SchedulerPartition \
         -o imi_output.tmp \
         -W $downloadScript $StartDate $EndDate $tropomiCache
-    wait
     cat imi_output.tmp >>${RunDirs}/imi_output.log
     rm imi_output.tmp
 else

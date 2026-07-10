@@ -126,7 +126,6 @@ reduce_dimension() {
             -p $SchedulerPartition \
             -o imi_output.tmp \
             -W "${python_args[@]}"
-        wait
         cat imi_output.tmp >>${RunDirs}/imi_output.log
         rm imi_output.tmp
         # check for any errors

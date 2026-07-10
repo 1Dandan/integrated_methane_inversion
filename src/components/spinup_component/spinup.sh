@@ -145,7 +145,6 @@ run_spinup() {
             -p $SchedulerPartition \
             -W ${RunName}_Spinup.run
     fi
-    wait
 
     # check if exited with non-zero exit code
     [ ! -f ".error_status_file.txt" ] || imi_failed $LINENO

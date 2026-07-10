@@ -153,7 +153,6 @@ run_hemco_sa() {
         -o ${RunName}_HEMCO_Prior_Emis.log \
         -p $SchedulerPartition \
         -W ${RunName}_HEMCO_Prior_Emis.run
-    wait
 
     # check if exited with non-zero exit code
     [ ! -f ".error_status_file.txt" ] || imi_failed $LINENO
@@ -337,7 +336,6 @@ run_prior_gchp() {
         -t $RequestedTime \
         -p $SchedulerPartition \
         -W ${RunName}_HEMCO_Prior_Emis.run
-    wait
 
     # check if exited with non-zero exit code
     [ ! -f ".error_status_file.txt" ] || imi_failed $LINENO

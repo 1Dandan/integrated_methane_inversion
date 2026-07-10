@@ -24,12 +24,10 @@ setup_kf() {
     # Define Kalman filter update periods
     if "$MakePeriodsCSV"; then
         python ${InversionPath}/src/components/kalman_component/make_periods_csv.py $StartDate $EndDate $UpdateFreqDays $RunDirs
-        wait
     fi
 
     # Create unit scale factor file
     python ${InversionPath}/src/components/kalman_component/make_unit_sf.py $StateVectorFile $RunDirs
-    wait
 
     # Create directory to archive prior scale factors for each inversion period
     mkdir -p ${RunDirs}/archive_sf
@@ -122,9 +120,7 @@ run_period() {
 
     # Set dates in geoschem_config.yml for prior, perturbation, and posterior runs
     python ${InversionPath}/src/components/kalman_component/change_dates.py $ConfigPath $StartDate_i $EndDate_i $RunDuration_i $UseGCHP $JacobianRunsDir
-    wait
     python ${InversionPath}/src/components/kalman_component/change_dates.py $ConfigPath $StartDate_i $EndDate_i $RunDuration_i $UseGCHP $PosteriorRunDir
-    wait
     if ! "$UseGCHP"; then
         echo "Edited Start/End dates in geoschem_config.yml for prior/perturbed/posterior simulations: $StartDate_i to $EndDate_i"
     else
@@ -133,7 +129,6 @@ run_period() {
     # Prepare initial (prior) emission scale factors for the current period
     echo "python path = $PYTHONPATH"
     python ${InversionPath}/src/components/kalman_component/prepare_sf.py $ConfigPath $period_i ${RunDirs} $NudgeFactor
-    wait
 
     # Dynamically generate state vector for each period
     if ("$ReducedDimensionStateVector" && "$DynamicKFClustering"); then
@@ -153,12 +148,10 @@ run_period() {
     # Update ScaleFactor.nc with the new posterior scale factors before running the posterior simulation
     # NOTE: This also creates the posterior_sf_period{i}.nc file in archive_sf/
     python ${InversionPath}/src/components/kalman_component/multiply_posteriors.py $period_i ${RunDirs} $LognormalErrors
-    wait
     echo "Multiplied posterior scale factors over record"
 
     # Print total posterior emissions
     python ${InversionPath}/src/components/kalman_component/print_posterior_emissions.py $ConfigPath $period_i ${RunDirs}
-    wait
 
     run_posterior
 

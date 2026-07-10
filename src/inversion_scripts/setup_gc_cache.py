@@ -83,7 +83,3 @@ if __name__ == "__main__":
     gc_destination_path = sys.argv[4]
 
     setup_gc_cache(startday, endday, gc_source_path, gc_destination_path)
-    
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os._exit(0)

@@ -93,13 +93,13 @@ if ! "$DisableRun0000"; then
         GCsourcepth="${BackgroundRunDir}/OutputDir"
         PriorOutputDir="${PriorRunDir}/OutputDir"
         # also need the prior cache so that we can visualize the prior simulation
-        python setup_gc_cache.py $StartDate $EndDate $PriorOutputDir $GCVizDir; wait
+        python setup_gc_cache.py $StartDate $EndDate $PriorOutputDir $GCVizDir
     else
         # for normal errors we use the prior run
         GCsourcepth="${PriorRunDir}/OutputDir"
     fi
 
-    python setup_gc_cache.py $StartDate $EndDate $GCsourcepth $GCDir; wait
+    python setup_gc_cache.py $StartDate $EndDate $GCsourcepth $GCDir
     printf "DONE -- setup_gc_cache.py\n\n"
 fi
 #=======================================================================
@@ -132,11 +132,11 @@ else
     buildJacobian="False"
 fi
 
-python jacobian.py ${invPath}/${configFile} $StartDate $EndDate $LonMinInvDomain $LonMaxInvDomain $LatMinInvDomain $LatMaxInvDomain $nElements $tropomiCache $BlendedTROPOMI $UseWaterObs $isPost $period_i $buildJacobian False; wait
+python jacobian.py ${invPath}/${configFile} $StartDate $EndDate $LonMinInvDomain $LonMaxInvDomain $LatMinInvDomain $LatMaxInvDomain $nElements $tropomiCache $BlendedTROPOMI $UseWaterObs $isPost $period_i $buildJacobian False
 if "$LognormalErrors"; then
     # for lognormal error visualization of the prior we sample the prior run
     # without constructing the jacobian matrix
-    python jacobian.py ${invPath}/${configFile} $StartDate $EndDate $LonMinInvDomain $LonMaxInvDomain $LatMinInvDomain $LatMaxInvDomain $nElements $tropomiCache $BlendedTROPOMI  $UseWaterObs $isPost $period_i False True; wait
+    python jacobian.py ${invPath}/${configFile} $StartDate $EndDate $LonMinInvDomain $LonMaxInvDomain $LatMinInvDomain $LatMaxInvDomain $nElements $tropomiCache $BlendedTROPOMI  $UseWaterObs $isPost $period_i False True
 fi
 printf " DONE -- jacobian.py\n\n"
 
@@ -158,7 +158,7 @@ if ! "$ArchiveJacobiansOnly"; then
         python_args=(invert.py ${OutputPath}/${RunName}/config_${RunName}.yml $nElements $JacobianDir $posteriorSF $LonMinInvDomain $LonMaxInvDomain $LatMinInvDomain $LatMaxInvDomain $Res $jacobian_sf $StateVectorFile $period_i)
         
         printf "Calling invert.py\n"
-        python "${python_args[@]}"; wait
+        python "${python_args[@]}"
         printf "DONE -- invert.py\n\n"
         #=======================================================================
         # Create gridded posterior scaling factor netcdf file
@@ -166,7 +166,7 @@ if ! "$ArchiveJacobiansOnly"; then
         GriddedPosterior="./gridded_posterior.nc"
 
         printf "Calling make_gridded_posterior.py\n"
-        python make_gridded_posterior.py $posteriorSF $StateVectorFile $GriddedPosterior; wait
+        python make_gridded_posterior.py $posteriorSF $StateVectorFile $GriddedPosterior
         printf "DONE -- make_gridded_posterior.py\n\n"
     fi
 fi

@@ -9,10 +9,7 @@ import os
 import datetime
 import yaml
 import gc
-from src.inversion_scripts.utils import (
-    save_obj,
-    clean_exit,
-)
+from src.inversion_scripts.utils import save_obj
 from src.inversion_scripts.operators.TROPOMI_operator import (
     apply_average_tropomi_operator,
     apply_tropomi_operator,
@@ -203,5 +200,3 @@ if __name__ == "__main__":
 
     results = Parallel(n_jobs=-1)(delayed(process)(filename) for filename in sat_files)
     print(f"Wrote files to {outputdir}")
-
-    clean_exit()

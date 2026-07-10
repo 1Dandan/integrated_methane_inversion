@@ -112,14 +112,13 @@ sed -i -e "s|sapphire,huce_cascade,seas_compute,shared|${partition}|g" \
     -e "s|-t 0-12:00|-t 07-00:00|g" \
     -e "s|-c 8|-c 48|g" geoschem.run
 sbatch -W geoschem.run
-wait
 
 # Write the boundary conditions using write_boundary_conditions.py
 cd "${cwd}"
 sbatch -W -J blended -o boundary_conditions.log --open-mode=append -p ${partition} -t 7-00:00 --mem 96000 -c 40 --wrap "source $condaFile; conda activate $condaEnv; python write_boundary_conditions.py True $blendedDir $gcStartDate $gcEndDate"
-wait # run for Blended TROPOMI+GOSAT
+# run for Blended TROPOMI+GOSAT
 sbatch -W -J tropomi -o boundary_conditions.log --open-mode=append -p ${partition} -t 7-00:00 --mem 96000 -c 40 --wrap "source $condaFile; conda activate $condaEnv; python write_boundary_conditions.py False $tropomiDir $gcStartDate $gcEndDate"
-wait # run for TROPOMI data
+# run for TROPOMI data
 echo "" >>"${cwd}/boundary_conditions.log"
 echo "Blended TROPOMI+GOSAT boundary conditions --> ${workDir}/blended-boundary-conditions" >>"${cwd}/boundary_conditions.log"
 echo "TROPOMI boundary conditions               --> ${workDir}/tropomi-boundary-conditions" >>"${cwd}/boundary_conditions.log"

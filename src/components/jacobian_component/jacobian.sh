@@ -646,7 +646,6 @@ run_jacobian() {
                     -p $SchedulerPartition \
                     -W run_bkgd_simulation.sh
             fi
-            wait
 
             printf "\n=== DONE BACKGROUND SIMULATION ===\n"
         fi
@@ -690,7 +689,6 @@ run_jacobian() {
                 -p $SchedulerPartition \
                 -W run_prior_simulation.sh
         fi
-        wait
         cat imi_output.tmp >>${RunDirs}/imi_output.log
         rm imi_output.tmp
         # check if prior simulation exited with non-zero exit code
@@ -717,7 +715,6 @@ run_jacobian() {
                     -p $SchedulerPartition \
                     -W run_bkgd_simulation.sh
             fi
-            wait
             # check if background simulation exited with non-zero exit code
             [ ! -f ".error_status_file.txt" ] || imi_failed $LINENO
             printf "=== DONE BACKGROUND SIMULATION ===\n"
@@ -744,7 +741,6 @@ run_jacobian() {
 
         # Get Jacobian scale factors
         python ${InversionPath}/src/inversion_scripts/get_jacobian_scalefactors.py $jacobian_period $RunDirs $ReferenceRunDir $KalmanMode
-        wait
         printf "Got Jacobian scale factors\n"
     fi
 }

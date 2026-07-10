@@ -49,7 +49,6 @@ run_preview() {
             -p $SchedulerPartition \
             -o imi_output.tmp \
             -W $preview_file $ConfigPath $state_vector_path $preview_dir $tropomi_cache
-        wait
         cat imi_output.tmp >>${RunDirs}/imi_output.log
         rm imi_output.tmp
         # check for any errors

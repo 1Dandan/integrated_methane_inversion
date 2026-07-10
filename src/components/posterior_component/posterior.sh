@@ -253,7 +253,6 @@ run_posterior() {
             -p $SchedulerPartition \
             -W ${RunName}_Posterior.run
     fi
-    wait
 
     # check if exited with non-zero exit code
     [ ! -f ".error_status_file.txt" ] || imi_failed $LINENO
