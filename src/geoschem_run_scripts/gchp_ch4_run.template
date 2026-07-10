@@ -102,10 +102,12 @@ if [[ $(( ${coreCount} % ${SLURM_NNODES} )) > 0 ]]; then
     planeCount=$(( ${planeCount} + 1 ))
 fi
 
-START_DATE=$(cat cap_restart)
+# get initial start date
+START_DATE=$(awk '/^[[:space:]]*BEG_DATE:/ {$1=""; sub(/^[[:space:]]+/, ""); print}' CAP.rc)
 if [[ "${START_DATE}" = "" ]]; then
     echo "ERROR: cap_restart is empty! Write your simulation start date 'YYYYMMDD 000000' to cap_restart." >> $log
 fi
+echo "$START_DATE" > cap_restart
 N=$(grep "CS_RES=" setCommonRunSettings.sh | cut -c 8- | xargs)
 initial_restart=./Restarts/GEOSChem.Restart.${START_DATE:0:8}_0000z.c${N}.nc4
 if [ ! -f $initial_restart ]; then
