@@ -105,7 +105,6 @@ START_DATE=$(awk '/^[[:space:]]*BEG_DATE:/ {$1=""; sub(/^[[:space:]]+/, ""); pri
 if [[ "${START_DATE}" = "" ]]; then
     echo "ERROR: cap_restart is empty! Write your simulation start date 'YYYYMMDD 000000' to cap_restart." >> $log
 fi
-echo "$START_DATE" > cap_restart
 N=$(grep "CS_RES=" setCommonRunSettings.sh | cut -c 8- | xargs)
 initial_restart=./Restarts/GEOSChem.Restart.${START_DATE:0:8}_0000z.c${N}.nc4
 if [ ! -f $initial_restart ]; then
@@ -126,6 +125,7 @@ if has_checkpoint; then
     prune_checkpoints
     ln -nsf ${RESTART_FILE} gchp_restart.nc4
 else
+    echo "$START_DATE" > cap_restart
     ln -nsf ${initial_restart} gchp_restart.nc4
 fi
 rm -f ./Restarts/gcchem_internal_checkpoint
