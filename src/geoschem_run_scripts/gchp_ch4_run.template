@@ -85,11 +85,6 @@ log="$id.log"
 rm -f .error_status_file.txt
 echo "Writing output to ${log}"
 
-# Update config files, set restart symlink, load run env, and do sanity checks
-source setCommonRunSettings.sh > ${log}
-source setRestartLink.sh >> ${log}
-source checkRunSettings.sh >> ${log}
-
 # Cannon-specific setting to get around connection issues at high # cores
 export OMPI_MCL_btl=openib
 
@@ -124,10 +119,6 @@ if has_checkpoint; then
     RESTART_FILE=$(last_checkpoint)
     RESTART_DATE=$(last_checkpoint_datetime)
     echo "$RESTART_DATE" > cap_restart
-    END_DATE=$(grep "END_DATE" CAP.rc | awk '{print $2, $3}')
-    RunDuration=$(get_run_duration "${RESTART_DATE:0:8}" "${END_DATE:0:8}")
-    sed -i -e "s/Run_Duration=\"[0-9]\{8\} 000000\"/Run_Duration=\"${RunDuration} 000000\"/" \
-            setCommonRunSettings.sh
     # Prune old internal checkpoints, keeping the two most recent as backup
     prune_checkpoints
     ln -nsf ${RESTART_FILE} gchp_restart.nc4
