@@ -119,7 +119,7 @@ if has_checkpoint; then
     RESTART_FILE=$(last_checkpoint)
     RESTART_DATE=$(last_checkpoint_datetime)
     echo "$RESTART_DATE" > cap_restart
-    # Prune old internal checkpoints, keeping the two most recent as backup
+    # Prune old internal checkpoints, keeping the most recent as backup
     prune_checkpoints
     ln -nsf ${RESTART_FILE} gchp_restart.nc4
 else
