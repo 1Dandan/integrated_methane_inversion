@@ -85,6 +85,9 @@ log="$id.log"
 rm -f .error_status_file.txt
 echo "Writing output to ${log}"
 
+# always run setCommonRunSettings.sh
+./setCommonRunSettings.sh
+
 # Cannon-specific setting to get around connection issues at high # cores
 export OMPI_MCL_btl=openib
 
@@ -123,7 +126,6 @@ if has_checkpoint; then
     prune_checkpoints
     ln -nsf ${RESTART_FILE} gchp_restart.nc4
 else
-    ./setCommonRunSettings.sh
     ln -nsf ${initial_restart} gchp_restart.nc4
 fi
 rm -f ./Restarts/gcchem_internal_checkpoint
