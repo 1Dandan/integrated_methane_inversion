@@ -81,6 +81,8 @@ id=namename
 # Define GEOS-Chem log file
 log="$id.log"
 
+echo '===> Run started at' `date` >> $log
+
 # remove error status file if present
 rm -f .error_status_file.txt
 echo "Writing output to ${log}"
