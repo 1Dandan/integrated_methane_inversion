@@ -79,7 +79,7 @@ function get_run_duration() {
 id=namename
 
 # Define GEOS-Chem log file
-log="$id.log"
+log="$id.$(date +"%Y%m%d_%H%M").log"
 
 echo '===> Run started at' `date` >> $log
 
