@@ -249,9 +249,9 @@ time srun -n ${coreCount} -N ${SLURM_NNODES} -m plane=${planeCount} --mpi=pmix .
 
 echo '===> Run ended at' `date` >> $log
 # Rename final gcchem_internal_checkpoint if new start time ok
-new_start_str=$(sed 's/ / /g' cap_restart)
-if [[ "${new_start_str}" = "${START_DATE}" || "${new_start_str}" = "" ]]; then
-   echo "ERROR: GCHP failed to run to completion. Check the log file for more information."
+new_start_str=$(cat cap_restart)
+if [[ "${new_start_str:0:8}" = "${START_DATE:0:8}" || "${new_start_str}" = "" ]]; then
+   echo "ERROR: GCHP failed to run to completion. Check the log file for more information." >> ${log}
    rm -f Restarts/gcchem_internal_checkpoint
    exit 1
 else
