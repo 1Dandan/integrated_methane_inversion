@@ -247,7 +247,6 @@ fi
 set +e
 time srun -n ${coreCount} -N ${SLURM_NNODES} -m plane=${planeCount} --mpi=pmix ./gchp >> ${log}
 
-echo '===> Run ended at' `date` >> $log
 # Rename final gcchem_internal_checkpoint if new start time ok
 new_start_str=$(cat cap_restart)
 if [[ "${new_start_str:0:8}" = "${START_DATE:0:8}" || "${new_start_str}" = "" ]]; then
@@ -257,5 +256,7 @@ if [[ "${new_start_str:0:8}" = "${START_DATE:0:8}" || "${new_start_str}" = "" ]]
 else
     mv Restarts/gcchem_internal_checkpoint Restarts/gcchem_internal_checkpoint.${new_start_str:0:8}_0000z.nc4
 fi
+
+echo '===> Run ended at' `date` >> $log
 
 exit 0
