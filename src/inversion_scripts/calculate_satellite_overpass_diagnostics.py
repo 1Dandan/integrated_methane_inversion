@@ -16,6 +16,7 @@ from src.inversion_scripts.utils import (
     check_is_OH_element,
     check_is_BC_element,
     build_pert_simulations_dict,
+    get_shared_end_date,
 )
 
 import warnings
@@ -95,8 +96,18 @@ def build_date_list(config):
     start = datetime.strptime(StartDate, "%Y%m%d")
     end = datetime.strptime(EndDate, "%Y%m%d")  # exclusive UTC end
 
+    # get common end date to partially calculate Jacobians
+    RunName = config["RunName"]
+    RunDirs = os.path.join(os.path.expandvars(config["OutputPath"]), config["RunName"])
+    
+    shared_end_date = get_shared_end_date(
+        jacobian_root=os.path.join(RunDirs, "jacobian_runs"),
+        run_name=RunName,
+    )
+    print(f"Latest shared date (exclusive): {shared_end_date}")
+    
     local_start = start - timedelta(days=1)
-    local_end_exclusive = end
+    local_end_exclusive = datetime.strptime(shared_end_date, "%Y%m%d")
 
     n_process = (local_end_exclusive - local_start).days
 

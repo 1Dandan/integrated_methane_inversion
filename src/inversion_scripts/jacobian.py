@@ -9,7 +9,10 @@ import os
 import datetime
 import yaml
 import gc
-from src.inversion_scripts.utils import save_obj
+from src.inversion_scripts.utils import (
+    save_obj,
+    get_shared_end_date,
+)
 from src.inversion_scripts.operators.TROPOMI_operator import (
     apply_average_tropomi_operator,
     apply_tropomi_operator,
@@ -118,9 +121,26 @@ if __name__ == "__main__":
         datetime.datetime.strptime(end, "%Y-%m-%d %H:%M:%S")
         - datetime.timedelta(days=1)
     )
+    
+
+    # get common end date to partially calculate Jacobians
+    RunName = config["RunName"]
+    RunDirs = os.path.join(os.path.expandvars(config["OutputPath"]), config["RunName"])
+    
+    shared_end_date = get_shared_end_date(
+        jacobian_root=os.path.join(RunDirs, "jacobian_runs"),
+        run_name=RunName,
+    )
+    shared_end = f"{shared_end_date[0:4]}-{shared_end_date[4:6]}-{shared_end_date[6:8]} 23:59:59"
+    gc_shared_enddate = np.datetime64(
+        datetime.datetime.strptime(shared_end, "%Y-%m-%d %H:%M:%S")
+        - datetime.timedelta(days=1)
+    )
+    print(f"Latest shared date (exclusive): {shared_end_date}")
+    
     print("Start:", gc_startdate)
     print("End:", gc_enddate)
-
+    
     # Get TROPOMI data filenames for the desired date range
     allfiles = glob.glob(f"{tropomi_cache}/*.nc")
     sat_files = []
@@ -130,7 +150,7 @@ if __name__ == "__main__":
         shortname = re.split(r"\.", shortname)[0]
         strdate = re.split(r"\.|_+|T", shortname)[4]
         strdate = datetime.datetime.strptime(strdate, "%Y%m%d")
-        if (strdate >= gc_startdate) and (strdate <= gc_enddate):
+        if (strdate >= gc_startdate) and (strdate <= gc_shared_enddate):
             sat_files.append(filename)
     sat_files.sort()
     print("Found", len(sat_files), "TROPOMI data files.")
