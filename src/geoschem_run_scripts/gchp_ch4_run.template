@@ -189,9 +189,6 @@ echo '===> Run started at' `date` >> $log
 rm -f .error_status_file.txt
 echo "Writing output to ${log}"
 
-# always run setCommonRunSettings.sh
-./setCommonRunSettings.sh
-
 # Cannon-specific setting to get around connection issues at high # cores
 export OMPI_MCL_btl=openib
 
@@ -230,6 +227,10 @@ if has_checkpoint; then
     ln -nsf ${RESTART_FILE} gchp_restart.nc4
 else
     echo "$START_DATE" > cap_restart
+    # run setCommonRunSettings.sh only at initial start date
+    #   as running it will update GCHP.rc to the new cap_restart and cause conflicting to
+    #   write gcchem_internal_checkpoint.${new_start_str:0:8}_0000z.nc4 which is already there
+    ./setCommonRunSettings.sh
     ln -nsf ${initial_restart} gchp_restart.nc4
 fi
 rm -f ./Restarts/gcchem_internal_checkpoint
@@ -247,5 +248,14 @@ set +e
 time srun -n ${coreCount} -N ${SLURM_NNODES} -m plane=${planeCount} --mpi=pmix ./gchp >> ${log}
 
 echo '===> Run ended at' `date` >> $log
+# Rename final gcchem_internal_checkpoint if new start time ok
+new_start_str=$(sed 's/ / /g' cap_restart)
+if [[ "${new_start_str}" = "${START_DATE}" || "${new_start_str}" = "" ]]; then
+   echo "ERROR: GCHP failed to run to completion. Check the log file for more information."
+   rm -f Restarts/gcchem_internal_checkpoint
+   exit 1
+else
+    mv Restarts/gcchem_internal_checkpoint Restarts/gcchem_internal_checkpoint.${new_start_str:0:8}_0000z.nc4
+fi
 
 exit 0

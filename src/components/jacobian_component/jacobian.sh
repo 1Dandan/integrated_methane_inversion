@@ -609,6 +609,27 @@ run_jacobian() {
         cd ${RunDirs}/jacobian_runs
         jacobian_start=$(date +%s)
 
+        # Enable nullglob so the loop doesn't run if no match is found
+        shopt -s nullglob
+
+        # Loop through directories starting with 'project_'
+        for dir in ${RunDirs}/jacobian_runs/${RunName}_*; do
+            echo "set run duration and checkpoint frequency 3 days: $dir"
+            if $UseGCHP; then
+                cd "$dir"
+                # set run duration and checkpoint frequency
+                RunDuration_chk=$(get_run_duration_from_checkpoint "$Checkpoint_Freq")
+                sed -i -e "s/Run_Duration=\"[0-9]\{8\} 000000\"/Run_Duration=\"${RunDuration_chk}\"/" \
+                    -e "s/^Midrun_Checkpoint=.*/Midrun_Checkpoint=ON/" \
+                    -e "s/^Checkpoint_Freq=.*/Checkpoint_Freq=${Checkpoint_Freq}/" \
+                    setCommonRunSettings.sh
+                
+                echo "$StartDate 000000" > cap_restart
+                ./setCommonRunSettings.sh
+            fi
+        done
+
+        cd "${RunDirs}/jacobian_runs"
         set +e
 
         printf "\n=== SUBMITTING JACOBIAN SIMULATIONS ===\n"

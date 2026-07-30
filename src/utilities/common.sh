@@ -420,3 +420,32 @@ get_run_duration() {
 
   printf "%04d%02d%02d\n" $years $months $days
 }
+
+get_run_duration_from_checkpoint() {
+    local checkpoint_freq="$1"
+    local hours_part hours days remaining_hours
+
+    # Expected format: H...H0000
+    # The last four digits represent mmss and must both be zero.
+    if [[ ! "$checkpoint_freq" =~ ^[0-9]+0000$ ]]; then
+        echo "ERROR: Checkpoint_Freq must contain hours only with mmss=0000: $checkpoint_freq" >&2
+        return 1
+    fi
+
+    hours_part="${checkpoint_freq:0:${#checkpoint_freq}-4}"
+
+    # Reject an empty hours field.
+    if [[ -z "$hours_part" ]]; then
+        echo "ERROR: Checkpoint_Freq has no hours value: $checkpoint_freq" >&2
+        return 1
+    fi
+
+    # Force base-10 interpretation for zero-padded values.
+    hours=$((10#$hours_part))
+
+    days=$((hours / 24))
+    remaining_hours=$((hours % 24))
+
+    printf '%08d %02d0000\n' \
+        "$days" "$remaining_hours"
+}
