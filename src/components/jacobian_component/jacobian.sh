@@ -609,27 +609,39 @@ run_jacobian() {
         cd ${RunDirs}/jacobian_runs
         jacobian_start=$(date +%s)
 
-        # Enable nullglob so the loop doesn't run if no match is found
-        shopt -s nullglob
+        if "$UseGCHP"; then
+            if [[ -z "${Checkpoint_Freq:-}" ]]; then
+                echo "Checkpoint_Freq is not defined; skipping run-duration and checkpoint changes."
+            else
+                # Validate and calculate once, before modifying any run directories.
+                if ! RunDuration_chk=$(
+                    get_run_duration_from_checkpoint "$Checkpoint_Freq"
+                ); then
+                    echo "ERROR: Invalid Checkpoint_Freq: $Checkpoint_Freq" >&2
+                    exit 1
+                fi
 
-        # Loop through directories starting with 'project_'
-        for dir in ${RunDirs}/jacobian_runs/${RunName}_*; do
-            echo "set run duration and checkpoint frequency 3 days: $dir"
-            if $UseGCHP; then
-                cd "$dir"
-                # set run duration and checkpoint frequency
-                RunDuration_chk=$(get_run_duration_from_checkpoint "$Checkpoint_Freq")
-                sed -i -e "s/Run_Duration=\"[0-9]\{8\} 000000\"/Run_Duration=\"${RunDuration_chk}\"/" \
-                    -e "s/^Midrun_Checkpoint=.*/Midrun_Checkpoint=ON/" \
-                    -e "s/^Checkpoint_Freq=.*/Checkpoint_Freq=${Checkpoint_Freq}/" \
-                    setCommonRunSettings.sh
-                
-                echo "$StartDate 000000" > cap_restart
-                ./setCommonRunSettings.sh
+                # Enable nullglob so the loop doesn't run if no match is found
+                shopt -s nullglob
+
+                # Loop through directories starting with 'project_'
+                for dir in ${RunDirs}/jacobian_runs/${RunName}_*; do
+                    echo "set run duration and checkpoint frequency (${Checkpoint_Freq}): $dir"
+                    cd "$dir"
+                    # set run duration and checkpoint frequency
+                    sed -i -e "s/Run_Duration=\"[0-9]\{8\} 000000\"/Run_Duration=\"${RunDuration_chk}\"/" \
+                        -e "s/^Midrun_Checkpoint=.*/Midrun_Checkpoint=ON/" \
+                        -e "s/^Checkpoint_Freq=.*/Checkpoint_Freq=${Checkpoint_Freq}/" \
+                        setCommonRunSettings.sh
+                    
+                    echo "$StartDate 000000" > cap_restart
+                    ./setCommonRunSettings.sh
+                done
+
+                cd "${RunDirs}/jacobian_runs"
             fi
-        done
+        fi
 
-        cd "${RunDirs}/jacobian_runs"
         set +e
 
         printf "\n=== SUBMITTING JACOBIAN SIMULATIONS ===\n"
