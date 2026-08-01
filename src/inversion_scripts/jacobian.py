@@ -130,6 +130,7 @@ if __name__ == "__main__":
     shared_end_date = get_shared_end_date(
         jacobian_root=os.path.join(RunDirs, "jacobian_runs"),
         run_name=RunName,
+        start_date=startday,
     )
     shared_end = f"{shared_end_date[0:4]}-{shared_end_date[4:6]}-{shared_end_date[6:8]} 23:59:59"
     gc_shared_enddate = np.datetime64(

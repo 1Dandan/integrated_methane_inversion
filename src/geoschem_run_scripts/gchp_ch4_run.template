@@ -156,145 +156,88 @@ function prune_checkpoints() {
 
 
 ###############################################################################
-# Output-file checking functions
+# Output cleanup
 ###############################################################################
-# Expected number of hourly records in each daily SpeciesConc file
-EXPECTED_TIME_STEPS=24
+
 OUTPUT_DIR="./OutputDir"
 
-# Return the length of the unlimited time dimension
-function get_time_length() {
-    local file="$1"
-    local time_len
-
-    [[ -f "$file" && -s "$file" ]] || return 1
-
-    time_len=$(
-        ncdump -h "$file" 2>/dev/null |
-        sed -nE \
-            's/^[[:space:]]*time = UNLIMITED ;[[:space:]]*\/\/[[:space:]]*\(([0-9]+) currently\).*/\1/p' |
-        head -n 1
-    )
-
-    [[ "$time_len" =~ ^[0-9]+$ ]] || return 1
-    printf '%s\n' "$time_len"
-}
-
-# Remove all GEOS-Chem output collections belonging to one incomplete date
-function remove_output_date() {
+# If a checkpoint date is supplied, remove only *.nc4 files dated on or
+# after that date.
+#
+# If no checkpoint date is supplied, remove all *.nc4 files.
+#
+# Files are selected using filenames only. NetCDF contents are not inspected.
+function remove_output_nc4_files() {
     local output_dir="$1"
-    local file_date="$2"
+    local checkpoint_date="${2:-}"
     local file
-    local found=0
+    local filename
+    local file_date
+    local removed=0
 
-    echo "Removing output files for incomplete date: ${file_date}"
+    if [[ ! -d "$output_dir" ]]; then
+        echo "Output directory does not exist yet; nothing to clean:"
+        echo "  $output_dir"
+        return 0
+    fi
+
+    if [[ -n "$checkpoint_date" &&
+          ! "$checkpoint_date" =~ ^[0-9]{8}$ ]]; then
+        echo "ERROR: Invalid checkpoint date: $checkpoint_date" >&2
+        return 1
+    fi
+
+    if [[ -n "$checkpoint_date" ]]; then
+        echo "Removing *.nc4 files dated ${checkpoint_date} or later from:"
+    else
+        echo "No dated checkpoint found."
+        echo "Removing all *.nc4 files from:"
+    fi
+
+    echo "  $output_dir"
 
     while IFS= read -r -d '' file; do
-        found=1
+
+        if [[ -n "$checkpoint_date" ]]; then
+            filename=${file##*/}
+
+            # Extract YYYYMMDD from filenames ending in:
+            #
+            #   .YYYYMMDD_0000z.nc4
+            if [[ "$filename" =~ \.([0-9]{8})_0000z\.nc4$ ]]; then
+                file_date=${BASH_REMATCH[1]}
+            else
+                # Preserve files whose dates cannot be determined.
+                continue
+            fi
+
+            # YYYYMMDD is fixed-width, so lexical comparison is valid.
+            if [[ "$file_date" < "$checkpoint_date" ]]; then
+                continue
+            fi
+        fi
+
         echo "  Removing: $file"
 
         if ! rm -f -- "$file"; then
-            echo "ERROR: Failed to remove $file" >&2
+            echo "ERROR: Failed to remove output file:" >&2
+            echo "  $file" >&2
             return 1
         fi
+
+        removed=$((removed + 1))
+
     done < <(
         find "$output_dir" \
             -maxdepth 1 \
             -type f \
-            -name "GEOSChem.*.${file_date}_0000z.nc4" \
+            -name '*.nc4' \
             -print0
     )
 
-    if [[ "$found" -eq 0 ]]; then
-        echo "  No matching files found."
-    fi
+    echo "Removed ${removed} *.nc4 output file(s)."
 }
 
-# Find incomplete daily SpeciesConc files and remove every GEOS-Chem
-# collection for those dates before MAPL reopens the output collections.
-function remove_incomplete_output_dates() {
-    local output_dir="$1"
-    local species_file
-    local filename
-    local file_date
-    local time_len
-    local date_to_remove
-
-    local -a species_files=()
-    declare -A incomplete_dates=()
-
-    # A new run may not have created OutputDir yet. This is not an error.
-    if [[ ! -d "$output_dir" ]]; then
-        echo "Output directory does not exist yet; nothing to clean: $output_dir"
-        return 0
-    fi
-
-    # Collect matching daily SpeciesConc files first. An existing but empty
-    # OutputDir, or one containing no SpeciesConc files, is also not an error.
-    mapfile -d '' -t species_files < <(
-        find "$output_dir" \
-            -maxdepth 1 \
-            -type f \
-            -name 'GEOSChem.SpeciesConc.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_0000z.nc4' \
-            -print0
-    )
-
-    if (( ${#species_files[@]} == 0 )); then
-        echo "No existing daily SpeciesConc files in $output_dir; nothing to clean."
-        return 0
-    fi
-
-    echo "Checking ${#species_files[@]} existing SpeciesConc file(s) for incomplete dates..."
-
-    for species_file in "${species_files[@]}"; do
-        filename=${species_file##*/}
-
-        if [[ "$filename" =~ ^GEOSChem\.SpeciesConc\.([0-9]{8})_0000z\.nc4$ ]]; then
-            file_date=${BASH_REMATCH[1]}
-        else
-            continue
-        fi
-
-        if ! time_len=$(get_time_length "$species_file"); then
-            echo "Incomplete or unreadable file:"
-            echo "  $species_file"
-            incomplete_dates["$file_date"]=1
-            continue
-        fi
-
-        if [[ "$time_len" -lt "$EXPECTED_TIME_STEPS" ]]; then
-            echo "Incomplete file: ${time_len}/${EXPECTED_TIME_STEPS} records"
-            echo "  $species_file"
-            incomplete_dates["$file_date"]=1
-
-        elif [[ "$time_len" -eq "$EXPECTED_TIME_STEPS" ]]; then
-            echo "Complete file: ${file_date}, ${time_len}/${EXPECTED_TIME_STEPS} records"
-
-        else
-            echo "WARNING: File contains more than ${EXPECTED_TIME_STEPS} records:" >&2
-            echo "  Records: $time_len" >&2
-            echo "  File: $species_file" >&2
-            echo "  It will not be deleted automatically." >&2
-        fi
-    done
-
-    if (( ${#incomplete_dates[@]} == 0 )); then
-        echo "No incomplete SpeciesConc dates found."
-        return 0
-    fi
-
-    while IFS= read -r date_to_remove; do
-        [[ -n "$date_to_remove" ]] || continue
-
-        if ! remove_output_date "$output_dir" "$date_to_remove"; then
-            return 1
-        fi
-    done < <(
-        printf '%s\n' "${!incomplete_dates[@]}" | sort
-    )
-
-    echo "Incomplete-output cleanup completed."
-}
 
 ###############################################################################
 # Initialize run
@@ -308,13 +251,13 @@ prune_logs
 
 # Recover a useful undated checkpoint left by the previous run.
 #
-# This must happen before the current log file is created.
+# This happens before the checkpoint and output-cleanup decisions.
 recover_undated_checkpoint
 
 # Define GEOS-Chem log file
 log="$id.$(date +"%Y%m%d_%H%M").log"
 
-echo '===> Run started at' `date` >> $log
+echo '===> Run started at' `date` >> "$log"
 
 # Remove error status file if present
 rm -f .error_status_file.txt
@@ -345,46 +288,56 @@ fi
 # Get initial start date
 START_DATE=$(awk '/^[[:space:]]*BEG_DATE:/ {$1=""; sub(/^[[:space:]]+/, ""); print}' CAP.rc)
 if [[ "${START_DATE}" = "" ]]; then
-    echo "ERROR: cap_restart is empty! Write your simulation start date 'YYYYMMDD 000000' to cap_restart." >> $log
+    echo "ERROR: cap_restart is empty! Write your simulation start date 'YYYYMMDD 000000' to cap_restart." >> "$log"
 fi
 N=$(grep "CS_RES=" setCommonRunSettings.sh | cut -c 8- | xargs)
 initial_restart=./Restarts/GEOSChem.Restart.${START_DATE:0:8}_0000z.c${N}.nc4
-if [ ! -f $initial_restart ]; then
-    echo "ERROR: inital restart file of ${initial_restart} does not exist! Set a soft link for your initial restart file." >> $log
+
+if [ ! -f "$initial_restart" ]; then
+    echo "ERROR: inital restart file of ${initial_restart} does not exist! Set a soft link for your initial restart file." >> "$log"
 fi
 
 # Remove the initial checkpoint file if it exists
 # as it will always be created at the start (when Checkpoint_Freq=HHMMSS)
 # but cannot be overwritten and thus will cause a running error
 initial_checkpoint=./Restarts/gcchem_internal_checkpoint.${START_DATE:0:8}_0000z.nc4
-rm -f $initial_checkpoint
+rm -f "$initial_checkpoint"
+
+# Empty means no dated checkpoint was found.
+CHECKPOINT_DATE=""
 
 if has_checkpoint; then
     RESTART_FILE=$(last_checkpoint)
     RESTART_DATE=$(last_checkpoint_datetime)
+    CHECKPOINT_DATE="${RESTART_DATE:0:8}"
     echo "$RESTART_DATE" > cap_restart
     # Prune old internal checkpoints, keeping the most recent as backup
     prune_checkpoints
-    ln -nsf ${RESTART_FILE} gchp_restart.nc4
+
+    ln -nsf "$RESTART_FILE" gchp_restart.nc4
 else
     echo "$START_DATE" > cap_restart
     # Run setCommonRunSettings.sh only at initial start date
     # as running it will update GCHP.rc to the new cap_restart and cause
     # conflicting writes to an existing checkpoint
     ./setCommonRunSettings.sh
-    ln -nsf ${initial_restart} gchp_restart.nc4
+
+    ln -nsf "$initial_restart" gchp_restart.nc4
 fi
 rm -f ./Restarts/gcchem_internal_checkpoint
 
 ###############################################################################
-# Remove incomplete output
+# Remove output files that will be recreated
 ###############################################################################
 
-# Remove incomplete output left by a cancelled or failed run. If the
-# SpeciesConc file for a date has fewer than 24 records or is unreadable,
-# remove all GEOSChem.* collections for that date so MAPL can recreate them.
-if ! remove_incomplete_output_dates "$OUTPUT_DIR"; then
-    echo "ERROR: Failed while removing incomplete output files." | tee -a "$log" >&2
+# With a checkpoint:
+#   Remove only *.nc4 outputs dated on or after the checkpoint date.
+#
+# Without a checkpoint:
+#   Remove every *.nc4 file from OutputDir.
+if ! remove_output_nc4_files "$OUTPUT_DIR" "$CHECKPOINT_DATE"; then
+    echo "ERROR: Failed while removing existing output files." |
+        tee -a "$log" >&2
     exit 1
 fi
 
@@ -462,8 +415,10 @@ echo "GCHP step has stopped; continuing to checkpoint renaming." >> "$log"
 
 # Rename final gcchem_internal_checkpoint if new start time is okay
 new_start_str=$(cat cap_restart)
-if [[ "${new_start_str:0:8}" = "${START_DATE:0:8}" || "${new_start_str}" = "" ]]; then
-    echo "ERROR: GCHP failed to run to completion. Check the log file for more information." >> ${log}
+if [[ "${new_start_str:0:8}" = "${START_DATE:0:8}" ||
+      "${new_start_str}" = "" ]]; then
+
+    echo "ERROR: GCHP failed to run to completion. Check the log file for more information." >> "$log"
     rm -f Restarts/gcchem_internal_checkpoint
     exit 1
 else
@@ -472,6 +427,6 @@ else
         Restarts/gcchem_internal_checkpoint.${new_start_str:0:8}_0000z.nc4
 fi
 
-echo '===> Run ended at' `date` >> $log
+echo '===> Run ended at' `date` >> "$log"
 
 exit 0

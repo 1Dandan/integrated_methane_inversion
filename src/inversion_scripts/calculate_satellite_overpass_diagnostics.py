@@ -103,6 +103,7 @@ def build_date_list(config):
     shared_end_date = get_shared_end_date(
         jacobian_root=os.path.join(RunDirs, "jacobian_runs"),
         run_name=RunName,
+        start_date=StartDate,
     )
     print(f"Latest shared date (exclusive): {shared_end_date}")
     

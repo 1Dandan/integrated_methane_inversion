@@ -19,42 +19,25 @@ from src.inversion_scripts.classify_TROPOMI_obs_to_CSgrids import(
     latlon_to_cartesian,
     build_kdtree,
 )
-from netCDF4 import Dataset
-
-
-def is_complete_nc_file(file_path: str, expected_hours: int = 24) -> bool:
-    """Return True if the NetCDF file has the expected time dimension length."""
-    try:
-        with Dataset(file_path, mode="r") as dataset:
-            if "time" not in dataset.dimensions:
-                return False
-
-            return len(dataset.dimensions["time"]) == expected_hours
-
-    except (OSError, RuntimeError):
-        return False
-
 
 def get_shared_end_date(
     jacobian_root: str,
     run_name: str,
-    collection: str = "SpeciesConc",
-    expected_hours: int = 24,
+    start_date: str = "20250101",
 ) -> str:
     """
-    Return the exclusive end date after the latest complete date shared
-    by every Jacobian OutputDir.
+    Return the minimum of the latest checkpoint dates from all Jacobian runs.
 
-    For example, if 20250103 is the latest shared complete file date,
-    return 20250104.
+    A run without a valid checkpoint is assigned start_date. If the final
+    returned date is less than or equal to start_date, raise an error.
     """
     run_pattern = os.path.join(jacobian_root, f"{run_name}_*")
 
-    run_dirs = sorted(
+    run_dirs = [
         path
         for path in glob.glob(run_pattern)
         if os.path.isdir(path)
-    )
+    ]
 
     if not run_dirs:
         raise FileNotFoundError(
@@ -62,84 +45,41 @@ def get_shared_end_date(
         )
 
     filename_regex = re.compile(
-        rf"^GEOSChem\.{re.escape(collection)}\."
-        rf"(?P<date>\d{{8}})_\d{{4}}z\.nc4$"
+        r"^gcchem_internal_checkpoint\.(\d{8})_0000z\.nc4$"
     )
 
-    files_by_run = []
+    latest_dates = []
 
     for run_dir in run_dirs:
-        output_dir = os.path.join(run_dir, "OutputDir")
+        restart_dir = os.path.join(run_dir, "Restarts")
+        checkpoint_dates = []
 
-        if not os.path.isdir(output_dir):
-            raise FileNotFoundError(
-                f"Missing OutputDir: {output_dir}"
-            )
-
-        file_pattern = os.path.join(
-            output_dir,
-            f"GEOSChem.{collection}.*_????z.nc4",
-        )
-
-        date_to_file = {}
-
-        for file_path in glob.glob(file_pattern):
-            filename = os.path.basename(file_path)
-            match = filename_regex.match(filename)
-
-            if match:
-                file_date = match.group("date")
-                date_to_file[file_date] = file_path
-
-        if not date_to_file:
-            raise ValueError(
-                f"No GEOSChem.{collection} files found in {output_dir}"
-            )
-
-        files_by_run.append(date_to_file)
-
-    shared_dates = set(files_by_run[0])
-
-    for date_to_file in files_by_run[1:]:
-        shared_dates &= set(date_to_file)
-
-    if not shared_dates:
-        raise ValueError(
-            "No file date is shared by every Jacobian OutputDir."
-        )
-
-    for file_date in sorted(shared_dates, reverse=True):
-        incomplete_files = []
-
-        for date_to_file in files_by_run:
-            file_path = date_to_file[file_date]
-
-            if not is_complete_nc_file(
-                file_path,
-                expected_hours=expected_hours,
+        if os.path.isdir(restart_dir):
+            for file_path in glob.glob(
+                os.path.join(
+                    restart_dir,
+                    "gcchem_internal_checkpoint.????????_0000z.nc4",
+                )
             ):
-                incomplete_files.append(file_path)
+                match = filename_regex.match(os.path.basename(file_path))
 
-        if not incomplete_files:
-            exclusive_end_date = (
-                datetime.strptime(file_date, "%Y%m%d")
-                + timedelta(days=1)
-            )
+                if match:
+                    checkpoint_dates.append(match.group(1))
 
-            return exclusive_end_date.strftime("%Y%m%d")
-
-        print(
-            f"Shared date {file_date} is incomplete in "
-            f"{len(incomplete_files)} run(s); checking the previous date."
+        latest_dates.append(
+            max(checkpoint_dates) if checkpoint_dates else start_date
         )
 
-        for file_path in incomplete_files:
-            print(f"  Incomplete: {file_path}")
+    shared_checkpoint_date = min(latest_dates)
 
-    raise ValueError(
-        f"No shared {collection} date has {expected_hours} complete "
-        "time records in every OutputDir."
-    )
+    if shared_checkpoint_date <= start_date:
+        raise ValueError(
+            f"Shared checkpoint date {shared_checkpoint_date} is not later "
+            f"than start date {start_date}. One or more runs may have no "
+            "valid checkpoint."
+        )
+
+    return shared_checkpoint_date
 
 def save_obj(obj, name):
     """Save something with Pickle."""
