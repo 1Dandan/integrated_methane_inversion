@@ -10,7 +10,7 @@
 ### --mem        : Requests this amount of memory in GB
 ### -p           : Requests these partitions where the job can run
 ### -t           : Requests time for the job (days-hours:minutes)
-###  --exclusive : Reserves entire nodes (i.e. to prevent backfilling jobs)
+### --exclusive  : Reserves entire nodes (i.e. to prevent backfilling jobs)
 ###############################################################################
 
 # Exit if command fails
@@ -19,9 +19,119 @@ set -e
 # Debug option to print all commands executed in this script
 #set -x
 
-# Expected number of hourly records in each daily SpeciesConc file
-EXPECTED_TIME_STEPS=24
-OUTPUT_DIR="./OutputDir"
+# Keep only the newest log file; delete older logs for this run ID
+function prune_logs() {
+    ls -1t "${id}".*.log 2>/dev/null \
+        | tail -n +2 \
+        | xargs -r rm -f --
+}
+
+###############################################################################
+# Recover an undated checkpoint left by the previous run
+###############################################################################
+
+function recover_undated_checkpoint() {
+    local undated_checkpoint="./Restarts/gcchem_internal_checkpoint"
+    local latest_log
+    local normalized_tail
+    local checkpoint_date
+    local dated_checkpoint
+
+    # No exact undated checkpoint exists. Nothing needs to be done.
+    if [[ ! -f "$undated_checkpoint" ]]; then
+        echo "No undated checkpoint found; recovery skipped."
+        return 0
+    fi
+
+    echo "Found undated checkpoint from previous run:"
+    echo "  $undated_checkpoint"
+
+    # Find the latest previous log for this run ID.
+    #
+    # This function is called before the current run creates its new log,
+    # so the newest matching log belongs to a previous run.
+    latest_log=$(
+        ls -1t "${id}".*.log 2>/dev/null |
+            head -n 1
+    )
+
+    if [[ -z "$latest_log" || ! -f "$latest_log" ]]; then
+        echo "WARNING: No previous ${id}.*.log file found." >&2
+        echo "Removing unvalidated undated checkpoint." >&2
+        rm -f -- "$undated_checkpoint"
+        return 0
+    fi
+
+    echo "Checking final 30 lines of:"
+    echo "  $latest_log"
+
+    # Remove whitespace before checking the two completion messages.
+    normalized_tail=$(
+        tail -n 30 -- "$latest_log" |
+            tr -d '[:space:]'
+    )
+
+    if [[ "$normalized_tail" != \
+          *"UsingparallelNetCDFtowritefile:Restarts/gcchem_internal_checkpoint"* ||
+          "$normalized_tail" != \
+          *"NOTusingbufferI/Oforfile:cap_restart"* ]]; then
+
+        echo "WARNING: Required checkpoint messages were not both found." >&2
+        echo "Removing unvalidated undated checkpoint." >&2
+        rm -f -- "$undated_checkpoint"
+        return 0
+    fi
+
+    # Extract the latest GCHP date from the final 30 log lines.
+    # Example:
+    #
+    #   GCHP Date: 2025/01/22
+    #
+    # becomes:
+    #
+    #   20250122
+    checkpoint_date=$(
+        tail -n 30 -- "$latest_log" |
+            sed -nE \
+                's|.*GCHP[[:space:]]+Date:[[:space:]]*([0-9]{4})/([0-9]{2})/([0-9]{2}).*|\1\2\3|p' |
+            tail -n 1
+    )
+
+    if [[ ! "$checkpoint_date" =~ ^[0-9]{8}$ ]]; then
+        echo "WARNING: Could not extract a valid GCHP date." >&2
+        echo "Removing unvalidated undated checkpoint." >&2
+        rm -f -- "$undated_checkpoint"
+        return 0
+    fi
+
+    dated_checkpoint="./Restarts/gcchem_internal_checkpoint.${checkpoint_date}_0000z.nc4"
+
+    # Do not overwrite an existing dated checkpoint.
+    if [[ -e "$dated_checkpoint" ]]; then
+        echo "WARNING: Dated checkpoint already exists:" >&2
+        echo "  $dated_checkpoint" >&2
+        echo "Removing redundant undated checkpoint." >&2
+        rm -f -- "$undated_checkpoint"
+        return 0
+    fi
+
+    echo "Recovering checkpoint from previous run:"
+    echo "  $undated_checkpoint"
+    echo "  -> $dated_checkpoint"
+
+    if ! mv -- "$undated_checkpoint" "$dated_checkpoint"; then
+        echo "ERROR: Failed to rename the undated checkpoint." >&2
+        echo "The undated checkpoint has been retained." >&2
+        return 1
+    fi
+
+    echo "Previous checkpoint recovered successfully."
+}
+
+
+###############################################################################
+# Existing checkpoint functions
+###############################################################################
 
 function has_checkpoint() {
     compgen -G "./Restarts/gcchem_internal_checkpoint*.nc4" > /dev/null
@@ -38,10 +148,19 @@ function last_checkpoint_datetime() {
 # Keep only the most recent internal checkpoints; delete older ones
 function prune_checkpoints() {
     local keep=1
+
     ls -1 ./Restarts/gcchem_internal_checkpoint*.nc4 2>/dev/null \
         | head -n -${keep} \
         | xargs -r rm -f
 }
+
+
+###############################################################################
+# Output-file checking functions
+###############################################################################
+# Expected number of hourly records in each daily SpeciesConc file
+EXPECTED_TIME_STEPS=24
+OUTPUT_DIR="./OutputDir"
 
 # Return the length of the unlimited time dimension
 function get_time_length() {
@@ -177,17 +296,34 @@ function remove_incomplete_output_dates() {
     echo "Incomplete-output cleanup completed."
 }
 
+###############################################################################
+# Initialize run
+###############################################################################
+
 # Define version ID
 id=namename
+
+# Remove old logs, but retain the newest previous log for checkpoint recovery.
+prune_logs
+
+# Recover a useful undated checkpoint left by the previous run.
+#
+# This must happen before the current log file is created.
+recover_undated_checkpoint
 
 # Define GEOS-Chem log file
 log="$id.$(date +"%Y%m%d_%H%M").log"
 
 echo '===> Run started at' `date` >> $log
 
-# remove error status file if present
+# Remove error status file if present
 rm -f .error_status_file.txt
 echo "Writing output to ${log}"
+
+
+###############################################################################
+# Configure GCHP
+###############################################################################
 
 # Cannon-specific setting to get around connection issues at high # cores
 export OMPI_MCL_btl=openib
@@ -201,7 +337,12 @@ if [[ $(( ${coreCount} % ${SLURM_NNODES} )) > 0 ]]; then
     planeCount=$(( ${planeCount} + 1 ))
 fi
 
-# get initial start date
+
+###############################################################################
+# Configure restart
+###############################################################################
+
+# Get initial start date
 START_DATE=$(awk '/^[[:space:]]*BEG_DATE:/ {$1=""; sub(/^[[:space:]]+/, ""); print}' CAP.rc)
 if [[ "${START_DATE}" = "" ]]; then
     echo "ERROR: cap_restart is empty! Write your simulation start date 'YYYYMMDD 000000' to cap_restart." >> $log
@@ -211,13 +352,13 @@ initial_restart=./Restarts/GEOSChem.Restart.${START_DATE:0:8}_0000z.c${N}.nc4
 if [ ! -f $initial_restart ]; then
     echo "ERROR: inital restart file of ${initial_restart} does not exist! Set a soft link for your initial restart file." >> $log
 fi
-# remove the initial checkpoint file if it exists
-#  as it will always be created at the start (when Checkpoint_Freq=HHMMSS) but cannot be overwritted
-#     and thus will cause running error
+
+# Remove the initial checkpoint file if it exists
+# as it will always be created at the start (when Checkpoint_Freq=HHMMSS)
+# but cannot be overwritten and thus will cause a running error
 initial_checkpoint=./Restarts/gcchem_internal_checkpoint.${START_DATE:0:8}_0000z.nc4
-if [ -f $initial_checkpoint ]; then
-    rm -f $initial_checkpoint
-fi
+rm -f $initial_checkpoint
+
 if has_checkpoint; then
     RESTART_FILE=$(last_checkpoint)
     RESTART_DATE=$(last_checkpoint_datetime)
@@ -227,13 +368,17 @@ if has_checkpoint; then
     ln -nsf ${RESTART_FILE} gchp_restart.nc4
 else
     echo "$START_DATE" > cap_restart
-    # run setCommonRunSettings.sh only at initial start date
-    #   as running it will update GCHP.rc to the new cap_restart and cause conflicting to
-    #   write gcchem_internal_checkpoint.${new_start_str:0:8}_0000z.nc4 which is already there
+    # Run setCommonRunSettings.sh only at initial start date
+    # as running it will update GCHP.rc to the new cap_restart and cause
+    # conflicting writes to an existing checkpoint
     ./setCommonRunSettings.sh
     ln -nsf ${initial_restart} gchp_restart.nc4
 fi
 rm -f ./Restarts/gcchem_internal_checkpoint
+
+###############################################################################
+# Remove incomplete output
+###############################################################################
 
 # Remove incomplete output left by a cancelled or failed run. If the
 # SpeciesConc file for a date has fewer than 24 records or is unreadable,
@@ -243,18 +388,88 @@ if ! remove_incomplete_output_dates "$OUTPUT_DIR"; then
     exit 1
 fi
 
-# Turn off exit if command fails to allow script to finish if GCHP exits early
-set +e
-time srun -n ${coreCount} -N ${SLURM_NNODES} -m plane=${planeCount} --mpi=pmix ./gchp >> ${log}
+###############################################################################
+# Run GCHP
+###############################################################################
 
-# Rename final gcchem_internal_checkpoint if new start time ok
+# Allow the script to continue after the intentionally cancelled srun step.
+set +e
+
+# This script has one srun command, so its Slurm step is .0.
+# For an array task, this produces an ID such as 12240_4.0.
+if [[ -n "${SLURM_ARRAY_JOB_ID:-}" &&
+      -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+    gchp_step_id="${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}.0"
+else
+    gchp_step_id="${SLURM_JOB_ID}.0"
+fi
+
+srun_error_log="slurm-${gchp_step_id}.stderr"
+rm -f -- "$srun_error_log"
+
+# Run GCHP in the background so this shell can monitor the log.
+srun \
+    -n "${coreCount}" \
+    -N "${SLURM_NNODES}" \
+    -m "plane=${planeCount}" \
+    --mpi=pmix \
+    ./gchp >> "$log" 2>> "$srun_error_log" &
+
+srun_pid=$!
+
+echo "Started GCHP step: $gchp_step_id" >> "$log"
+
+# Monitor the final log lines while GCHP is running.
+while kill -0 "$srun_pid" 2>/dev/null; do
+    sleep 2
+
+    normalized_tail=$(
+        tail -n 30 -- "$log" 2>/dev/null |
+            tr -d '[:space:]'
+    )
+
+    if [[ "$normalized_tail" == \
+          *"UsingparallelNetCDFtowritefile:Restarts/gcchem_internal_checkpoint"* &&
+          "$normalized_tail" == \
+          *"NOTusingbufferI/Oforfile:cap_restart"* &&
+          -s "./Restarts/gcchem_internal_checkpoint" ]]; then
+
+        {
+            echo
+            echo "Completed checkpoint detected."
+            echo "Cancelling GCHP step: $gchp_step_id"
+        } >> "$log"
+
+        # Cancel only the srun/GCHP step, not the surrounding batch script.
+        if scancel --signal=TERM "$gchp_step_id"; then
+            break
+        else
+            echo "WARNING: Failed to cancel $gchp_step_id; retrying." \
+                >> "$log"
+        fi
+    fi
+done
+
+# Wait until the cancelled srun step has fully exited.
+# Its nonzero status is expected and intentionally ignored.
+wait "$srun_pid" || true
+
+echo "GCHP step has stopped; continuing to checkpoint renaming." >> "$log"
+
+###############################################################################
+# Rename final checkpoint
+###############################################################################
+
+# Rename final gcchem_internal_checkpoint if new start time is okay
 new_start_str=$(cat cap_restart)
 if [[ "${new_start_str:0:8}" = "${START_DATE:0:8}" || "${new_start_str}" = "" ]]; then
-   echo "ERROR: GCHP failed to run to completion. Check the log file for more information." >> ${log}
-   rm -f Restarts/gcchem_internal_checkpoint
-   exit 1
+    echo "ERROR: GCHP failed to run to completion. Check the log file for more information." >> ${log}
+    rm -f Restarts/gcchem_internal_checkpoint
+    exit 1
 else
-    mv Restarts/gcchem_internal_checkpoint Restarts/gcchem_internal_checkpoint.${new_start_str:0:8}_0000z.nc4
+    mv \
+        Restarts/gcchem_internal_checkpoint \
+        Restarts/gcchem_internal_checkpoint.${new_start_str:0:8}_0000z.nc4
 fi
 
 echo '===> Run ended at' `date` >> $log

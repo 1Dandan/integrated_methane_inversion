@@ -633,9 +633,11 @@ run_jacobian() {
                         -e "s/^Midrun_Checkpoint=.*/Midrun_Checkpoint=ON/" \
                         -e "s/^Checkpoint_Freq=.*/Checkpoint_Freq=${Checkpoint_Freq}/" \
                         setCommonRunSettings.sh
-                    
+                    org_start_str=$(<cap_restart)
                     echo "$StartDate 000000" > cap_restart
                     ./setCommonRunSettings.sh
+                    # set back to original value
+                    echo "$org_start_str" > cap_restart
                 done
 
                 cd "${RunDirs}/jacobian_runs"
