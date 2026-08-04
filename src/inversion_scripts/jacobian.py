@@ -10,7 +10,7 @@ import datetime
 import yaml
 import gc
 from src.inversion_scripts.utils import (
-    save_obj,
+    save_obj_atomic,
     get_shared_end_date,
 )
 from src.inversion_scripts.operators.TROPOMI_operator import (
@@ -210,9 +210,9 @@ if __name__ == "__main__":
             if output == None:
                 return 0
             print("Saving .pkl file")
-            save_obj(output, f"{outputdir}/{date}_GCtoTROPOMI.pkl")
-            save_obj(viz_output, f"{vizdir}/{date}_GCtoTROPOMI.pkl")
-            
+            save_obj_atomic(output, f"{outputdir}/{date}_GCtoTROPOMI.pkl")
+            save_obj_atomic(viz_output, f"{vizdir}/{date}_GCtoTROPOMI.pkl")
+
             del output, viz_output
             gc.collect()
             return 0

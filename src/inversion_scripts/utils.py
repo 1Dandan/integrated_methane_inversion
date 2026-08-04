@@ -19,6 +19,7 @@ from src.inversion_scripts.classify_TROPOMI_obs_to_CSgrids import(
     latlon_to_cartesian,
     build_kdtree,
 )
+import tempfile
 
 def get_shared_end_date(
     jacobian_root: str,
@@ -81,6 +82,42 @@ def get_shared_end_date(
 
     return shared_checkpoint_date
 
+def save_obj_atomic(obj, output_fpath):
+    """Save an object without exposing a partially written final pickle file.
+
+    The object is written to a temporary file in the same directory. The
+    temporary file replaces the final path only after save_obj() completes.
+
+    If processing is interrupted during writing, only the temporary file can
+    be incomplete. The final output is either complete, unchanged, or absent.
+    """
+    output_dir = os.path.dirname(output_fpath)
+    output_basename = os.path.basename(output_fpath)
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    fd, tmp_fpath = tempfile.mkstemp(
+        prefix=f".{output_basename}.",
+        suffix=".tmp",
+        dir=output_dir,
+    )
+    os.close(fd)
+
+    try:
+        save_obj(obj, tmp_fpath)
+
+        # Atomic because the temporary and final files are on the same
+        # filesystem and in the same directory.
+        os.replace(tmp_fpath, output_fpath)
+
+    except BaseException:
+        try:
+            os.remove(tmp_fpath)
+        except FileNotFoundError:
+            pass
+
+        raise
+    
 def save_obj(obj, name):
     """Save something with Pickle."""
 

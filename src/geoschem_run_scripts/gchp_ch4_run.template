@@ -254,11 +254,21 @@ prune_logs
 # This happens before the checkpoint and output-cleanup decisions.
 recover_undated_checkpoint
 
-# Define GEOS-Chem log file
+## Define GEOS-Chem log file
 log="$id.$(date +"%Y%m%d_%H%M").log"
 
-echo '===> Run started at' `date` >> "$log"
+echo "===> Run (Job ${SLURM_JOB_ID:-unknown}) started at $(date)" >> "$log"
 
+instance_type=""
+if command -v ec2-metadata >/dev/null 2>&1; then
+    instance_type=$(timeout 2 ec2-metadata -t 2>/dev/null | awk '{print $2}') || true
+fi
+
+if [[ -n "$instance_type" ]]; then
+    printf '\nUsing AWS %s\n\n' "$instance_type" >> "$log"
+else
+    printf '\nNot running on AWS, or EC2 metadata is unavailable\n\n' >> "$log"
+fi
 # Remove error status file if present
 rm -f .error_status_file.txt
 echo "Writing output to ${log}"
@@ -360,6 +370,7 @@ fi
 srun_error_log="slurm-${gchp_step_id}.stderr"
 rm -f -- "$srun_error_log"
 
+echo '===> Executing GCHP at' `date` >> $log
 # Run GCHP in the background so this shell can monitor the log.
 srun \
     -n "${coreCount}" \
@@ -406,7 +417,7 @@ done
 # Wait until the cancelled srun step has fully exited.
 # Its nonzero status is expected and intentionally ignored.
 wait "$srun_pid" || true
-
+echo '===> Execution of GCHP done at' `date` >> $log
 echo "GCHP step has stopped; continuing to checkpoint renaming." >> "$log"
 
 ###############################################################################
@@ -427,6 +438,6 @@ else
         Restarts/gcchem_internal_checkpoint.${new_start_str:0:8}_0000z.nc4
 fi
 
-echo '===> Run ended at' `date` >> "$log"
+echo "===> Run (Job ${SLURM_JOB_ID:-unknown}) ended at $(date)" >> "$log"
 
 exit 0
