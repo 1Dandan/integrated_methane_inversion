@@ -1,6 +1,7 @@
 # Sample all diagnostics at satellite overpass time
 import sys
 import os
+import glob
 import tempfile
 import shutil
 import numpy as np
@@ -17,6 +18,8 @@ from src.inversion_scripts.utils import (
     check_is_BC_element,
     build_pert_simulations_dict,
     get_shared_end_date,
+    read_stage_marker,
+    write_stage_marker,
 )
 
 import warnings
@@ -42,9 +45,11 @@ def write_netcdf_atomic(output_ds, output_fpath):
 
     os.makedirs(output_dir, exist_ok=True)
 
+    # Undotted so a leftover from a hard kill is visible, and suffixed .tmp so
+    # the S3 upload filters exclude it -- ".tmp.nc4" matched neither.
     fd, tmp_fpath = tempfile.mkstemp(
-        prefix=f".{output_basename}.",
-        suffix=".tmp.nc4",
+        prefix=f"{output_basename}.",
+        suffix=".tmp",
         dir=output_dir,
     )
     os.close(fd)
@@ -69,17 +74,60 @@ def write_netcdf_atomic(output_ds, output_fpath):
         raise
 
 
+def require_input_file(file_path, purpose):
+    """Raise when a required OutputDir input is absent.
+
+    An absent input used to be treated as "no data", leaving the affected
+    cells NaN while the diagnostic was still written. That is correct only
+    for dates outside [StartDate, EndDate), where no simulation output
+    exists by construction. Once OutputDir is pruned for already-processed
+    dates, an in-window input that has been deleted, or not restored, would
+    otherwise be indistinguishable from a completed date, so it is a hard
+    error instead.
+    """
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(
+            f"Required {purpose} input is missing: {file_path}"
+        )
+
+    return file_path
+
+
 # ---------------------------------------------------------------------------
 # Helper: build date list
 # ---------------------------------------------------------------------------
+def local_end_exclusive_for(shared_end_date, utc_end):
+    """First local date NOT coverable given a shared end date.
+
+    While simulations are progressing, the latest local date is excluded
+    because it may require UTC data from the following day. Once the shared
+    end date reaches EndDate, local dates through EndDate - 1 are all covered.
+
+    Shared by the current window and by the one a marker records, so the two
+    can never disagree about what "finished" meant.
+    """
+    local_end_exclusive = datetime.strptime(shared_end_date, "%Y%m%d")
+
+    if local_end_exclusive != utc_end:
+        local_end_exclusive -= timedelta(days=1)
+
+    return local_end_exclusive
+
+
 def build_date_list(config):
     """Return local overpass dates needed to cover the UTC simulation window.
 
     StartDate and EndDate are UTC dates, with EndDate exclusive.
 
-    While simulations are progressing, exclude the latest local date because
-    it may require UTC data from the following day. Once shared_end_date reaches
-    EndDate, include all local dates through EndDate - 1.
+    Dates an existing marker already covers are dropped. The marker is written
+    only after every run and date completed, so re-deriving its window and
+    resuming from the end of it repeats no work. This is not only a saving:
+    once prune_outputdir.py has removed the OutputDir dates both stages were
+    finished with, the inputs for those dates are gone, and asking for them
+    again would raise rather than quietly produce nothing.
+
+    Set OVERPASS_IGNORE_MARKER=1 to process the full window regardless. That
+    requires the OutputDir inputs to still be present.
     """
     StartDate = str(config["StartDate"])
     EndDate = str(config["EndDate"])
@@ -102,13 +150,7 @@ def build_date_list(config):
     print(f"Latest shared date (exclusive): {shared_end_date}")
 
     local_start = start - timedelta(days=1)
-    local_end_exclusive = datetime.strptime(
-        shared_end_date,
-        "%Y%m%d",
-    )
-
-    if local_end_exclusive != end:
-        local_end_exclusive -= timedelta(days=1)
+    local_end_exclusive = local_end_exclusive_for(shared_end_date, end)
 
     n_process = (local_end_exclusive - local_start).days
 
@@ -117,7 +159,30 @@ def build_date_list(config):
         for i in range(n_process)
     ]
 
-    return start, end, date_list
+    if os.environ.get("OVERPASS_IGNORE_MARKER") == "1":
+        print("OVERPASS_IGNORE_MARKER=1: processing the full window")
+        return start, end, date_list, shared_end_date
+
+    marker_end_date = read_stage_marker(RunDirs, "overpass", StartDate)
+
+    if marker_end_date is not None:
+        done_through = local_end_exclusive_for(marker_end_date, end)
+        resume_from = done_through.strftime("%Y%m%d")
+        already_done = [d for d in date_list if d < resume_from]
+        date_list = [d for d in date_list if d >= resume_from]
+
+        print(
+            f"Marker S{marker_end_date}: {len(already_done)} local date(s) "
+            f"through {(done_through - timedelta(days=1)).strftime('%Y%m%d')} "
+            f"already complete, skipping them"
+        )
+
+        if not date_list:
+            print("Nothing new to process")
+        else:
+            print(f"Resuming at {date_list[0]}, {len(date_list)} date(s) to go")
+
+    return start, end, date_list, shared_end_date
 
 
 # ---------------------------------------------------------------------------
@@ -148,10 +213,30 @@ def load_overpass_grid(
             f"{RunName}_0001",
         )
 
+        # Only lons/lats are read from this file, and those do not vary with
+        # date, so any SpeciesConc file from the run serves. Falling back to
+        # whatever is present keeps this working once OutputDir has been
+        # pruned back to its most recent dates.
         grid_file = os.path.join(
             Jacobian_RunDir,
             f"OutputDir/GEOSChem.SpeciesConc.{StartDate}_0000z.nc4",
         )
+
+        if not os.path.isfile(grid_file):
+            available = sorted(glob.glob(os.path.join(
+                Jacobian_RunDir,
+                "OutputDir/GEOSChem.SpeciesConc.*.nc4",
+            )))
+
+            if not available:
+                raise FileNotFoundError(
+                    "Cannot build the overpass grid: no SpeciesConc file in "
+                    f"{Jacobian_RunDir}/OutputDir, and "
+                    f"{overpass_grid_fpath} does not exist. Restore it from "
+                    "the archive."
+                )
+
+            grid_file = available[-1]
 
         overpass_ds = generate_on_sim_grid(
             grid_file,
@@ -333,9 +418,7 @@ def presave_met_arrays(
             f"OutputDir/GEOSChem.{prefix}.{date_str}_0000z.nc4",
         )
 
-        if not os.path.isfile(met_file):
-            saved_met[date_str] = None
-            continue
+        require_input_file(met_file, "met")
 
         AirDen, BxH = load_met_fields(met_file)
 
@@ -601,8 +684,14 @@ def sample_baserun_file_type(
     closest_hour,
     day_offset,
     dims,
+    require_current=False,
+    require_next=False,
 ):
-    """Sample one base-run diagnostic file type at local overpass time."""
+    """Sample one base-run diagnostic file type at local overpass time.
+
+    require_current/require_next mark the days that fall inside the UTC
+    simulation window, whose OutputDir file must therefore be present.
+    """
     file_current = os.path.join(
         Jacobian_RunDir,
         f"OutputDir/{file_prefix}.{date_str}_0000z.nc4",
@@ -612,6 +701,12 @@ def sample_baserun_file_type(
         Jacobian_RunDir,
         f"OutputDir/{file_prefix}.{next_date_str}_0000z.nc4",
     )
+
+    if require_current:
+        require_input_file(file_current, file_prefix)
+
+    if require_next:
+        require_input_file(file_next, file_prefix)
 
     with ExitStack() as stack:
         ds_current = (
@@ -863,6 +958,8 @@ def process_run_day(
                 closest_hour,
                 day_offset,
                 dims,
+                require_current=(current_met is not None),
+                require_next=(next_met is not None),
             )
 
             output_ds = attach_overpass_grid_metadata(
@@ -906,15 +1003,20 @@ def process_run_day(
     if os.path.isfile(output_fpath):
         return
 
+    # current_met/next_met are set only for days inside the UTC simulation
+    # window, so those are exactly the days whose SpeciesConc file must exist.
+    if current_met is not None:
+        require_input_file(sim_file_utc, "SpeciesConc")
+
+    if next_met is not None:
+        require_input_file(sim_file_utc_nextday, "SpeciesConc")
+
     with ExitStack() as stack:
         sim_utc_ds = (
             stack.enter_context(
                 xr.open_dataset(sim_file_utc)
             )
-            if (
-                current_met is not None
-                and os.path.isfile(sim_file_utc)
-            )
+            if current_met is not None
             else None
         )
 
@@ -922,10 +1024,7 @@ def process_run_day(
             stack.enter_context(
                 xr.open_dataset(sim_file_utc_nextday)
             )
-            if (
-                next_met is not None
-                and os.path.isfile(sim_file_utc_nextday)
-            )
+            if next_met is not None
             else None
         )
 
@@ -1033,8 +1132,37 @@ def calculate_satellite_overpass_diagnostics(
         f"{RunName}/CS_grids/",
     )
 
-    start, end, date_list = build_date_list(config)
+    start, end, date_list, shared_end_date = build_date_list(config)
     StartDate = str(config["StartDate"])
+
+    # Returned before the grid is loaded and before any OutputDir file is
+    # touched. A face whose OutputDir has been pruned has nothing left to read,
+    # so reaching further would fail on inputs that are gone by design.
+    if not date_list:
+        existing = read_stage_marker(
+            os.path.join(OutputPath, RunName),
+            "overpass",
+            StartDate,
+        )
+
+        # A marker ahead of the current shared end date means the checkpoints
+        # S is derived from went backwards. What it records still happened, so
+        # rewriting it downward would discard a true claim; leave it and say so.
+        if existing is not None and existing > shared_end_date:
+            print(
+                f"WARNING: marker S{existing} is ahead of the current shared "
+                f"end date {shared_end_date}. Checkpoints appear to have been "
+                f"removed. Leaving the marker as it stands."
+            )
+            return
+
+        write_stage_marker(
+            os.path.join(OutputPath, RunName),
+            "overpass",
+            StartDate,
+            shared_end_date,
+        )
+        return
 
     overpass_ds = load_overpass_grid(
         config,
@@ -1063,7 +1191,33 @@ def calculate_satellite_overpass_diagnostics(
         )
     ]
 
-    num_jacobian_runs = len(Jacobian_RunDir_list)
+    # Run indices are read from the directory names rather than inferred from
+    # how many directories there are. The two agree only when the runs are
+    # numbered from zero: with DisableRun0000 the directories are
+    # _0001.._000N, so a count used as an exclusive range bound stops at N-1
+    # and silently skips the last run. Reading the names is also unaffected by
+    # any unrelated directory sitting alongside the runs.
+    run_indices = sorted(
+        run_i
+        for run_i in (
+            int(name.rsplit("_", 1)[1])
+            for name in Jacobian_RunDir_list
+            if name.startswith(f"{RunName}_")
+            and name.rsplit("_", 1)[1].isdigit()
+        )
+        if run_i >= start_run_num
+    )
+
+    if not run_indices:
+        raise FileNotFoundError(
+            f"No Jacobian run directories matching {RunName}_#### found in "
+            f"{JacobianRunDirs}"
+        )
+
+    print(
+        f"Processing {len(run_indices)} Jacobian run(s): "
+        f"{run_indices[0]:04d}..{run_indices[-1]:04d}"
+    )
 
     pert_simulations_dict = build_pert_simulations_dict(
         config,
@@ -1108,10 +1262,17 @@ def calculate_satellite_overpass_diagnostics(
                 lat_name,
                 DisableRun0000,
             )
-            for run_i in range(
-                start_run_num,
-                num_jacobian_runs,
-            )
+            for run_i in run_indices
+        )
+
+        # Reached only when every run and date above completed. Missing
+        # OutputDir inputs now raise, so a marker cannot cover a date that
+        # was silently written as all-NaN.
+        write_stage_marker(
+            os.path.join(OutputPath, RunName),
+            "overpass",
+            StartDate,
+            shared_end_date,
         )
 
     finally:

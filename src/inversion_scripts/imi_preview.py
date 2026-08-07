@@ -593,7 +593,7 @@ def get_sectoral_outputs(prior_ds, areas, mask, preview_dir):
     )
 
     # Add labels and title
-    ax.set_xlabel("Emissions ($Tg\ a^{-1}$)")
+    ax.set_xlabel(r"Emissions ($Tg\ a^{-1}$)")
     ax.set_ylabel("Sector")
     ax.set_title("Sectoral Emissions (Prior Inventory)")
     ax.set_yticks(ind)

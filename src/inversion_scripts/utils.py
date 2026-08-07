@@ -1,5 +1,6 @@
 import os
 import glob
+import json
 import subprocess
 import pickle
 from datetime import datetime, timedelta
@@ -81,6 +82,214 @@ def get_shared_end_date(
         )
 
     return shared_checkpoint_date
+
+def read_empty_granules(workdir: str, filter_signature) -> set:
+    """
+    Return granules a previous round found to hold no usable observation.
+
+    Re-reading such a granule reaches the same conclusion, since whether it
+    survives filtering depends only on the settings in filter_signature. The
+    signature is compared so a changed domain, date range, water-observation
+    setting or product would force a fresh look rather than inheriting a
+    verdict reached under different rules.
+    """
+    manifest_path = os.path.join(workdir, "data_converted_manifest.json")
+
+    if not os.path.isfile(manifest_path):
+        return set()
+
+    try:
+        with open(manifest_path) as handle:
+            manifest = json.load(handle)
+    except (OSError, ValueError):
+        return set()
+
+    if manifest.get("filter_signature") != list(filter_signature):
+        print(
+            "data_converted manifest was written under different filter "
+            "settings; re-examining every granule"
+        )
+        return set()
+
+    return {
+        entry["granule"]
+        for entry in manifest.get("granules", [])
+        if entry.get("status") == "no_valid_obs"
+    }
+
+
+def write_converted_manifest(
+    workdir: str,
+    start_date: str,
+    shared_end_date: str,
+    results,
+    filter_signature=None,
+) -> str:
+    """
+    Record every TROPOMI granule this inversion window selected, and its fate.
+
+    Each entry is one granule with a status:
+
+        written        the operator returned data and a pickle was saved
+        cached         a pickle from an earlier round was already in place
+        no_valid_obs   the granule held no usable observation, so by design
+                       nothing was written
+
+    Without this, "is data_converted complete?" can only be guessed at, since
+    a granule that legitimately produces no pickle is indistinguishable from
+    one that was never processed. The granule list is rebuilt for the whole
+    window on every round, so each manifest describes the full window rather
+    than an increment.
+
+    Written next to the data it describes, in the inversion directory.
+    """
+    entries = [
+        {"granule": granule, "status": status}
+        for granule, status in sorted(results)
+    ]
+
+    counts = {}
+
+    for entry in entries:
+        counts[entry["status"]] = counts.get(entry["status"], 0) + 1
+
+    manifest = {
+        "start_date": str(start_date),
+        "shared_end_date": str(shared_end_date),
+        # What the observation filter depended on. A later round reuses the
+        # no_valid_obs verdicts only when this still matches.
+        "filter_signature": (
+            list(filter_signature) if filter_signature is not None else None
+        ),
+        "granule_count": len(entries),
+        "counts": counts,
+        "granules": entries,
+    }
+
+    manifest_path = os.path.join(workdir, "data_converted_manifest.json")
+
+    # Written atomically so an interrupted run cannot leave a manifest that
+    # describes fewer granules than were actually processed.
+    fd, tmp_path = tempfile.mkstemp(
+        prefix="data_converted_manifest.",
+        suffix=".tmp",
+        dir=workdir,
+    )
+
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(manifest, handle, indent=2)
+
+        os.replace(tmp_path, manifest_path)
+
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except FileNotFoundError:
+            pass
+
+        raise
+
+    print(
+        f"Wrote data_converted manifest: {manifest_path} "
+        f"({len(entries)} granules, {counts})"
+    )
+
+    return manifest_path
+
+
+def write_stage_marker(
+    run_dirs: str,
+    stage: str,
+    start_date: str,
+    shared_end_date: str,
+) -> str:
+    """
+    Record that one processing stage finished for [start_date, shared_end_date).
+
+    The marker is an empty file in the run directory (the parent of both
+    jacobian_runs/ and inversion/), e.g.
+
+        overpass_complete.20250101_S20250815
+
+    The fields are the configured StartDate and the shared end date the stage
+    ran against, NOT a coverage range: overpass output spans local dates
+    StartDate-1 to S-2, while data_converted spans granule dates StartDate to
+    S-1. The S prefix keeps the second field from reading as an end date.
+
+    What the two markers share is S, which is the point. A consumer compares
+    the S carried by every marker it requires and refuses to act unless they
+    agree, so one stage running further than the other cannot go unnoticed.
+
+    shared_end_date grows as the Jacobian runs advance, so any earlier marker
+    for this stage is removed. There is always exactly one marker per stage,
+    and a superseded window can never be left behind to be read as current.
+
+    Both stages are driven from run_imi.sh under `set -eEo pipefail` with an
+    ERR trap, so a failure aborts the run before its marker is written.
+    """
+    marker_path = os.path.join(
+        run_dirs,
+        f"{stage}_complete.{start_date}_S{shared_end_date}",
+    )
+
+    os.makedirs(run_dirs, exist_ok=True)
+
+    with open(marker_path, "w"):
+        pass
+
+    # Written first, so an interruption here leaves the older marker in place
+    # rather than no marker at all.
+    for stale_path in glob.glob(
+        os.path.join(run_dirs, f"{stage}_complete.*")
+    ):
+        if stale_path != marker_path:
+            os.remove(stale_path)
+            print(f"Removed superseded marker: {stale_path}")
+
+    print(f"Wrote completion marker: {marker_path}")
+
+    return marker_path
+
+
+def read_stage_marker(
+    run_dirs: str,
+    stage: str,
+    start_date: str,
+):
+    """
+    Return the shared end date recorded by a stage's marker, or None.
+
+    Only a marker whose start_date matches the configured one is honoured:
+    a marker left over from a different window says nothing about this one.
+
+    write_stage_marker keeps exactly one marker per stage, so more than one
+    match means something outside these scripts created it. That is reported
+    and treated as no marker, because acting on the wrong S would skip work
+    that was never done.
+    """
+    matches = glob.glob(
+        os.path.join(run_dirs, f"{stage}_complete.{start_date}_S*")
+    )
+
+    if not matches:
+        return None
+
+    if len(matches) > 1:
+        print(
+            f"WARNING: {len(matches)} {stage} markers in {run_dirs}; "
+            f"ignoring all of them: {sorted(os.path.basename(m) for m in matches)}"
+        )
+        return None
+
+    recorded = os.path.basename(matches[0]).rsplit("_S", 1)[1]
+
+    if not (len(recorded) == 8 and recorded.isdigit()):
+        print(f"WARNING: unreadable date in marker {matches[0]}; ignoring it")
+        return None
+
+    return recorded
+
 
 def save_obj_atomic(obj, output_fpath):
     """Save an object without exposing a partially written final pickle file.
@@ -337,7 +546,7 @@ def plot_ensemble(
     # Labeling
     ax.set_xticks([1, 0])
     ax.set_xticklabels(["Posterior", "Prior"])
-    ax.set_ylabel("Emissions ($Tg\ a^{-1}$)")
+    ax.set_ylabel(r"Emissions ($Tg\ a^{-1}$)")
     ax.set_title("Total Emissions")
     ax.legend()
     if plot_save_path:

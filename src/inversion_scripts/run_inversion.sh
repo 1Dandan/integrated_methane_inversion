@@ -20,6 +20,21 @@ rm -f .error_status_file.txt
 # trap and exit on errors
 trap 'send_error $LINENO' ERR
 
+# Keep only the newest Slurm logs in this directory, the running job included.
+# One is written per submission and they accumulate indefinitely; what each run
+# actually did is recorded in data_converted_manifest.json, so the older ones
+# carry nothing that is not held elsewhere.
+#
+# Sorted by modification time rather than by name, because the %j job id is
+# numeric and sorts wrongly as text once it gains a digit.
+KEEP_INVERSION_LOGS=${KEEP_INVERSION_LOGS:-2}
+
+ls -1t run_inversion_*.out 2>/dev/null \
+    | tail -n +$((KEEP_INVERSION_LOGS + 1)) \
+    | while IFS= read -r old_log; do
+          rm -f -- "$old_log"
+      done
+
 printf "\n=== PARSING CONFIG FILE ===\n"
 
 invPath={INVERSION_PATH}

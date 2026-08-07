@@ -241,6 +241,30 @@ if ("$DoPosterior" && ! "$KalmanMode"); then
     run_posterior
 fi
 
+##=======================================================================
+##  Delete OutputDir files both processing stages are finished with
+##=======================================================================
+##
+## Runs last, after both stages have had their chance to write markers. The
+## markers are the whole gate: prune_outputdir.py refuses unless an overpass
+## and an inversion marker both exist and carry the same shared end date S,
+## which only happens when both stages completed over a consistent window.
+##
+## A blocked prune is the normal outcome for a submission that ran only one
+## stage -- then only one marker advanced and the two disagree. That is the
+## check working, so it must not fail the job.
+##
+## Where the filesystem exports its own deletes to S3, this is all that is
+## needed; nothing has to be removed from the bucket by hand.
+if [ "${PruneOutputDir:-false}" = "true" ] && ! "$KalmanMode"; then
+    printf "\n=== PRUNING OUTPUTDIR ===\n"
+
+    python -u src/utilities/prune_outputdir.py "$ConfigFile" \
+        --execute \
+        --record-deleted "${RunDirs}/outputdir_pruned_keys.txt" \
+        || printf "\nPrune did not run; see the reason above. Continuing.\n"
+fi
+
 printf "\n=== DONE RUNNING THE IMI ===\n"
 
 # Run time
