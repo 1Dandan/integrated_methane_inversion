@@ -8,6 +8,7 @@ import numpy as np
 import xarray as xr
 import yaml
 from datetime import datetime, timedelta
+import joblib
 from joblib import Parallel, delayed
 from contextlib import ExitStack
 
@@ -378,6 +379,49 @@ def load_met_fields(met_file):
 # ---------------------------------------------------------------------------
 # Helper: pre-save met arrays as .npy for memory-mapped access
 # ---------------------------------------------------------------------------
+def _presave_one_date(
+    date_str,
+    utc_start,
+    utc_end,
+    JacobianRunDirs,
+    RunName,
+    run_id,
+    prefix,
+    tmp_dir,
+):
+    """Read one date's met fields and write them to tmp_dir as .npy.
+
+    Returns (date_str, paths) with paths None for a date outside the window.
+    Split out of presave_met_arrays so the dates can be read in parallel:
+    each one opens a different file and writes different outputs, so there is
+    nothing shared to serialise on.
+    """
+    date_dt = datetime.strptime(date_str, "%Y%m%d")
+
+    if not utc_start <= date_dt < utc_end:
+        return date_str, None
+
+    met_file = os.path.join(
+        JacobianRunDirs,
+        f"{RunName}_{run_id:04d}",
+        f"OutputDir/GEOSChem.{prefix}.{date_str}_0000z.nc4",
+    )
+
+    require_input_file(met_file, "met")
+
+    AirDen, BxH = load_met_fields(met_file)
+
+    airden_fpath = os.path.join(tmp_dir, f"AirDen_{date_str}.npy")
+    bxh_fpath = os.path.join(tmp_dir, f"BxH_{date_str}.npy")
+
+    np.save(airden_fpath, AirDen)
+    np.save(bxh_fpath, BxH)
+
+    del AirDen, BxH
+
+    return date_str, {"AirDen": airden_fpath, "BxH": bxh_fpath}
+
+
 def presave_met_arrays(
     date_list,
     utc_start,
@@ -386,6 +430,7 @@ def presave_met_arrays(
     RunName,
     tmp_dir,
     DisableRun0000=False,
+    n_workers=1,
 ):
     """Pre-save each required UTC met date once for memory-mapped access."""
     if DisableRun0000:
@@ -403,44 +448,51 @@ def presave_met_arrays(
             (date_dt + timedelta(days=1)).strftime("%Y%m%d")
         )
 
+    ordered = sorted(required_dates)
+    args = (utc_start, utc_end, JacobianRunDirs, RunName, run_id, prefix, tmp_dir)
+
+    # The first in-window date is read here, alone, to find out how large one
+    # date actually is on this grid. Everything after it runs in a pool sized
+    # from that measurement. Guessing instead would mean picking a number that
+    # is either wasteful at C36 or fatal at C360.
     saved_met = {}
+    measured_mb = None
+    rest = []
 
-    for date_str in sorted(required_dates):
-        date_dt = datetime.strptime(date_str, "%Y%m%d")
+    for i, date_str in enumerate(ordered):
+        date_str, paths = _presave_one_date(date_str, *args)
+        saved_met[date_str] = paths
+        if paths is not None:
+            measured_mb = met_arrays_mb(paths)
+            rest = ordered[i + 1:]
+            break
 
-        if not utc_start <= date_dt < utc_end:
-            saved_met[date_str] = None
-            continue
+    if rest:
+        # Two dates are live at once in the step that follows -- a date and the
+        # one after it -- alongside the simulation output being read against
+        # them. OVERPASS_MEM_FACTOR scales the measurement to cover that.
+        factor = float(os.environ.get("OVERPASS_MEM_FACTOR", "6"))
+        per_worker = int(measured_mb * factor) if measured_mb else None
 
-        met_file = os.path.join(
-            JacobianRunDirs,
-            f"{RunName}_{run_id:04d}",
-            f"OutputDir/GEOSChem.{prefix}.{date_str}_0000z.nc4",
+        pool = memory_capped_workers(n_workers, per_worker)
+        if measured_mb:
+            print(
+                f"Met arrays are {measured_mb} MB/date; "
+                f"presaving {len(rest)} more date(s) on {pool} worker(s)"
+            )
+
+        saved_met.update(
+            dict(
+                Parallel(
+                    n_jobs=pool,
+                    backend="loky",
+                    pre_dispatch="2*n_jobs",
+                )(
+                    delayed(_presave_one_date)(date_str, *args)
+                    for date_str in rest
+                )
+            )
         )
-
-        require_input_file(met_file, "met")
-
-        AirDen, BxH = load_met_fields(met_file)
-
-        airden_fpath = os.path.join(
-            tmp_dir,
-            f"AirDen_{date_str}.npy",
-        )
-
-        bxh_fpath = os.path.join(
-            tmp_dir,
-            f"BxH_{date_str}.npy",
-        )
-
-        np.save(airden_fpath, AirDen)
-        np.save(bxh_fpath, BxH)
-
-        del AirDen, BxH
-
-        saved_met[date_str] = {
-            "AirDen": airden_fpath,
-            "BxH": bxh_fpath,
-        }
 
     met_paths = {}
 
@@ -1066,6 +1118,106 @@ def process_run_day(
         )
 
 
+def slurm_memory_budget_mb():
+    """The job's memory allocation in MB, or None when not under Slurm.
+
+    This is the number the job is killed against, so it is the one worth
+    respecting -- not the machine's total memory, which on a shared node
+    belongs to other people too.
+    """
+    per_node = os.environ.get("SLURM_MEM_PER_NODE")
+    if per_node and per_node.isdigit():
+        return int(per_node)
+
+    per_cpu = os.environ.get("SLURM_MEM_PER_CPU")
+    cpus = os.environ.get("SLURM_CPUS_PER_TASK") or os.environ.get(
+        "SLURM_JOB_CPUS_PER_NODE"
+    )
+    if per_cpu and per_cpu.isdigit() and cpus and cpus.isdigit():
+        return int(per_cpu) * int(cpus)
+
+    return None
+
+
+def met_arrays_mb(paths):
+    """Size of one date's presaved met arrays, in MB, or None if unreadable."""
+    if not paths:
+        return None
+    try:
+        total = os.path.getsize(paths["AirDen"]) + os.path.getsize(paths["BxH"])
+    except (OSError, KeyError, TypeError):
+        return None
+    return max(1, total // (1024 * 1024))
+
+
+def memory_capped_workers(requested, per_worker_mb=None):
+    """Lower the worker count to what the memory allocation will hold.
+
+    Each worker holds a date's met fields and the run output it is reading, so
+    peak memory scales with how many run at once. With plenty of memory this
+    binds on nothing; inside a small allocation it is the difference between
+    finishing and being killed part-way, which on this step means losing the
+    whole face's diagnostics.
+
+    The per-worker figure should be measured rather than assumed: the arrays
+    are a couple of hundred MB at C36 and two orders of magnitude larger at
+    C360, so a constant that suits one resolution is dangerously wrong at the
+    other. Callers pass what they measured; OVERPASS_MEM_PER_WORKER_MB
+    overrides it, and 0 disables the cap.
+    """
+    override = os.environ.get("OVERPASS_MEM_PER_WORKER_MB")
+    if override is not None and override.strip().isdigit():
+        per_worker = int(override)
+        if per_worker <= 0:
+            return requested
+    elif per_worker_mb:
+        per_worker = per_worker_mb
+    else:
+        return requested
+
+    budget = slurm_memory_budget_mb()
+    if budget is None:
+        return requested
+
+    # Leave the parent its own share: it holds the datasets that get handed
+    # to every worker, and it is still resident while they run.
+    usable = max(0, budget - max(2000, budget // 10))
+    allowed = max(1, usable // per_worker)
+
+    if allowed < requested:
+        print(
+            f"Limiting to {allowed} worker(s): {budget} MB allocated, "
+            f"~{per_worker} MB per worker "
+            f"(OVERPASS_MEM_PER_WORKER_MB to change)"
+        )
+        return allowed
+
+    return requested
+
+
+def split_dates(date_list, n_chunks):
+    """Split date_list into at most n_chunks contiguous, near-equal pieces.
+
+    Contiguous rather than round-robin: consecutive dates read neighbouring
+    files, and one worker walking a run of them is kinder to the filesystem
+    than several interleaving across the whole year.
+    """
+    if n_chunks <= 1 or len(date_list) <= 1:
+        return [date_list]
+
+    n_chunks = min(n_chunks, len(date_list))
+    size, extra = divmod(len(date_list), n_chunks)
+
+    chunks = []
+    start = 0
+    for i in range(n_chunks):
+        stop = start + size + (1 if i < extra else 0)
+        chunks.append(date_list[start:stop])
+        start = stop
+
+    return chunks
+
+
 def process_run_dates(
     run_i,
     date_list,
@@ -1228,6 +1380,25 @@ def calculate_satellite_overpass_diagnostics(
         prefix="overpass_met_"
     )
 
+    # n_workers is a joblib convention: -1 means every core, -2 all but one.
+    # Both the chunk arithmetic and the message below need a real count.
+    #
+    # "Every core" means every core of the allocation, not of the machine.
+    # joblib.cpu_count() reports the latter, so on a shared node -1 would open
+    # 112 workers against 48 allocated cores and spend the difference in
+    # context switching.
+    slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+    n_cores = (
+        int(slurm_cpus)
+        if slurm_cpus and slurm_cpus.isdigit()
+        else joblib.cpu_count()
+    )
+
+    effective_workers = (
+        n_workers if n_workers > 0 else max(1, n_cores + 1 + n_workers)
+    )
+    n_workers = effective_workers
+
     try:
         met_paths = presave_met_arrays(
             date_list,
@@ -1237,6 +1408,47 @@ def calculate_satellite_overpass_diagnostics(
             RunName,
             tmp_dir,
             DisableRun0000,
+            n_workers=n_workers,
+        )
+
+        # Reuse what the prologue measured. process_run_day holds a date and
+        # the one after it, plus the simulation output read against them, so
+        # it is the heavier of the two steps -- if either is going to exhaust
+        # the allocation it is this one.
+        sample = next(
+            (v["current"] for v in met_paths.values() if v.get("current")),
+            None,
+        )
+        measured_mb = met_arrays_mb(sample)
+        if measured_mb:
+            factor = float(os.environ.get("OVERPASS_MEM_FACTOR", "6"))
+            effective_workers = memory_capped_workers(
+                effective_workers, int(measured_mb * factor)
+            )
+            n_workers = effective_workers
+
+        # Tasks are (run, slice of dates), not (run) alone. A face with one
+        # Jacobian run used to produce exactly one task, so every core beyond
+        # the first sat idle no matter what n_jobs said.
+        #
+        # Chunks rather than one task per date: loky pickles every argument to
+        # every task, and overpass_ds and pert_simulations_dict go to each one.
+        # Aiming at a few times n_workers keeps all the cores fed while paying
+        # that cost tens of times rather than thousands.
+        # Higher balances the load better; lower pickles the shared arguments
+        # fewer times. Four is a starting point, not a measured optimum.
+        chunk_factor = int(os.environ.get("OVERPASS_CHUNK_FACTOR", "4"))
+        n_chunks = max(
+            1,
+            -(-(chunk_factor * effective_workers) // max(1, len(run_indices))),
+        )
+        date_chunks = split_dates(date_list, n_chunks)
+
+        print(
+            f"Parallel over {len(run_indices)} run(s) x "
+            f"{len(date_chunks)} date chunk(s) "
+            f"= {len(run_indices) * len(date_chunks)} task(s) "
+            f"on {effective_workers} worker(s)"
         )
 
         Parallel(
@@ -1247,7 +1459,7 @@ def calculate_satellite_overpass_diagnostics(
         )(
             delayed(process_run_dates)(
                 run_i,
-                date_list,
+                date_chunk,
                 met_paths,
                 config,
                 n_elements,
@@ -1263,6 +1475,7 @@ def calculate_satellite_overpass_diagnostics(
                 DisableRun0000,
             )
             for run_i in run_indices
+            for date_chunk in date_chunks
         )
 
         # Reached only when every run and date above completed. Missing

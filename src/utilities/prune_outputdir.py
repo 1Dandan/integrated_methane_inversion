@@ -513,6 +513,16 @@ def process_face(config_path, args, timestamp):
         )
         return "skipped"
 
+    # ---- record only ----
+    # The local deletion happened in an earlier pass that ran with
+    # --defer-manifest. This call marks the face pruned now that the objects
+    # are confirmed gone from the bucket too, which is the point at which the
+    # claim becomes true.
+    if args.record_manifest_only:
+        write_manifest(run_dirs, cutoff_date, 0, timestamp)
+        report("RECORDED", f"manifest set to cutoff {cutoff_date}")
+        return "skipped"
+
     # ---- idempotent resume ----
     manifest = read_manifest(run_dirs)
 
@@ -683,12 +693,26 @@ def process_face(config_path, args, timestamp):
     for path in deletable:
         os.remove(path)
 
-    write_manifest(
-        run_dirs,
-        cutoff_date,
-        len(deletable),
-        timestamp,
-    )
+    # The manifest is what stops a second pass repeating this work, so it must
+    # not claim more than has actually happened. Deleting the local files is
+    # only half of a prune -- the objects still have to go from the bucket, and
+    # that is a later step in a different script which can fail on its own.
+    #
+    # Writing the manifest here regardless meant a face whose upload step died
+    # came back, read "already pruned through <cutoff>", emitted an empty
+    # deletion list, and was reported a success with its OutputDir still in the
+    # bucket. Nothing was lost, but nothing was pruned either, and a retry
+    # could never fix it.
+    #
+    # With --defer-manifest the caller writes it once the bucket side is
+    # confirmed, via --record-manifest-only.
+    if not args.defer_manifest:
+        write_manifest(
+            run_dirs,
+            cutoff_date,
+            len(deletable),
+            timestamp,
+        )
 
     report(
         "PRUNED",
@@ -786,6 +810,26 @@ def parse_arguments():
             "Append every path deleted, or that would be deleted in a dry "
             "run, to this file. Feed it to s3_upload_and_prune.sh when the "
             "bucket does not track filesystem deletes for you."
+        ),
+    )
+
+    parser.add_argument(
+        "--defer-manifest",
+        action="store_true",
+        help=(
+            "Delete the files but do not write outputdir_pruned.json. The "
+            "caller records it with --record-manifest-only once the objects "
+            "are confirmed gone from the bucket, so the manifest never claims "
+            "a prune that only happened on this filesystem."
+        ),
+    )
+
+    parser.add_argument(
+        "--record-manifest-only",
+        action="store_true",
+        help=(
+            "Write outputdir_pruned.json for the cutoff that applies now, and "
+            "delete nothing. Pairs with --defer-manifest."
         ),
     )
 

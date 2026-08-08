@@ -7,17 +7,32 @@ file exactly what the current processing scripts would produce?
 
     existence -> openability -> expected variables -> no NaN
 
-There is deliberately NO exemption for the StartDate-1 file (20241231). That
-file is mostly NaN by construction, so it is reported as incomplete, deleted
-along with everything else that failed, and regenerated. Regeneration works
-even though no OutputDir file exists for that date: it is outside the UTC
-simulation window, so process_run_day builds it from the next day alone.
+The StartDate-1 file (20241231) is mostly NaN by construction: overpass
+sampling of local date L reads UTC L and L+1, and UTC L is outside the
+simulation window for that one date.
 
-That also means this script is a run-once-before-processing tool. Re-running
-it after a successful reprocessing will flag 20241231 again, forever. After
-reprocessing, the overpass_complete marker is the statement of completeness;
-files are written atomically (temp file + os.replace), so a completed run
-cannot leave a partial file behind.
+Whether that counts as damage depends on whether the face has been processed,
+so the overpass marker decides it:
+
+  no marker    the face has not been processed, so the file is flagged and
+               rebuilt along with everything else. process_run_day can build
+               it from the next day alone, so no OutputDir is needed for it.
+  marker       the overpass stage completed and wrote that file deliberately.
+               Flagging it would delete a correct file and, since deleting
+               overpass output retires the marker, reprocess the whole window
+               -- and on a face that has since been pruned the OutputDir needed
+               to rebuild it is gone, so the deletion cannot be undone.
+
+--allow-nan-first-date forces the exemption on regardless, which is what
+process_face_cycle.sh passes.
+
+Because that turns on the marker rather than on a flag, a sweep across every
+face does the right thing per face: unprocessed ones get their StartDate-1
+file rebuilt, processed ones keep theirs.
+
+After reprocessing, the overpass_complete marker is the statement of
+completeness; files are written atomically (temp file + os.replace), so a
+completed run cannot leave a partial file behind.
 
 Paths that failed are printed to stdout, one per line, for
 delete_files_from_list.sh. Everything else, including files that are simply
@@ -34,6 +49,7 @@ Exit codes:
 
 import argparse
 import concurrent.futures as cf
+import contextlib
 import multiprocessing as mp
 import os
 import sys
@@ -64,6 +80,7 @@ from src.inversion_scripts.calculate_satellite_overpass_diagnostics import (  # 
 )
 from src.inversion_scripts.utils import (  # noqa: E402
     build_pert_simulations_dict,
+    read_stage_marker,
 )
 
 # Grid metadata copied onto every diagnostic by attach_overpass_grid_metadata.
@@ -101,7 +118,33 @@ MAX_VALUES_PER_READ = 10_000_000
 
 # Fork (not spawn) keeps per-file overhead near a millisecond: the child
 # inherits the already-imported netCDF4/HDF5 libraries.
-FORK = mp.get_context("fork")
+def _isolation_context():
+    """A start method whose children inherit none of this process's locks.
+
+    The readers run in a thread pool and each one starts a child, so the naive
+    choice -- fork -- is the wrong one. Only the forking thread exists in the
+    child, so a lock another thread happened to hold at that instant is held
+    forever by a thread that is not there. The child then deadlocks inside
+    libhdf5 or the allocator, the parent waits out its timeout, and a perfectly
+    good file is reported as a read that never finished.
+
+    That failure is intermittent by nature: it depends on what the other
+    threads were doing at the moment of the fork, so it lands on a different
+    file every run and never reproduces when one file is checked on its own.
+
+    forkserver forks from a separate, single-threaded helper, so there is
+    nothing to inherit. spawn starts a fresh interpreter and is the fallback.
+    """
+    for method in ("forkserver", "spawn"):
+        try:
+            return mp.get_context(method)
+        except ValueError:
+            continue
+
+    return mp.get_context("fork")
+
+
+FORK = _isolation_context()
 
 # Serialize the fork() call itself so two forks are never concurrent.
 _FORK_LOCK = threading.Lock()
@@ -416,6 +459,37 @@ def parse_arguments():
     )
 
     parser.add_argument(
+        "--allow-nan-first-date",
+        action="store_true",
+        help=(
+            "Do not flag NaN in the StartDate-1 file. That date is only "
+            "partly covered -- overpass sampling of local date L reads UTC L "
+            "and L+1, and UTC L does not exist for it -- so NaN there is "
+            "correct, not damage. Without this the file is flagged on every "
+            "run, deleted, regenerated, and flagged again; and because "
+            "deleting overpass output also retires the overpass marker, the "
+            "whole window reprocesses each time. Set it for repeated or "
+            "automated runs; leave it off for a one-off cleanup that is meant "
+            "to rebuild that file."
+        ),
+    )
+
+    parser.add_argument(
+        "--flag-nan-first-date",
+        action="store_true",
+        help=(
+            "Flag the StartDate-1 file for deletion even though its NaN is "
+            "expected, and even when a marker would otherwise exempt it. Use "
+            "for a clean rebuild rather than a resume: the file is deleted, "
+            "the overpass marker goes with it, and the whole window is "
+            "recomputed. The rebuilt file is partly NaN again -- that is "
+            "correct -- so leaving this on makes every pass reprocess "
+            "everything. Requires the OutputDir inputs to still be present, "
+            "which they are not on a face that has already been pruned."
+        ),
+    )
+
+    parser.add_argument(
         "--per-file-timeout",
         type=float,
         default=180.0,
@@ -468,7 +542,36 @@ def main():
         return 1
 
     # The authoritative expected date list, straight from the producer.
-    _, _, date_list, shared_end_date = build_date_list(config)
+    #
+    # OVERPASS_IGNORE_MARKER, because the producer and the checker want
+    # different things from the same function. build_date_list normally drops
+    # the dates an existing marker already covers, which is right when the
+    # point is to avoid redoing work -- but this is verifying that work, and a
+    # complete face would otherwise return no dates at all and check nothing.
+    #
+    # Output is redirected too: build_date_list logs to stdout, and stdout here
+    # carries the paths to delete and nothing else. A stray line reaches
+    # delete_files_from_list.sh, which rejects it and refuses the whole list.
+    previous_ignore = os.environ.get("OVERPASS_IGNORE_MARKER")
+    os.environ["OVERPASS_IGNORE_MARKER"] = "1"
+
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            _, _, date_list, shared_end_date = build_date_list(config)
+    finally:
+        if previous_ignore is None:
+            del os.environ["OVERPASS_IGNORE_MARKER"]
+        else:
+            os.environ["OVERPASS_IGNORE_MARKER"] = previous_ignore
+
+    if not date_list:
+        print(
+            f"ERROR: no local dates to check. Shared end date "
+            f"{shared_end_date} leaves the window empty, which means the "
+            f"simulations have not advanced past {config['StartDate']}.",
+            file=sys.stderr,
+        )
+        return 1
 
     expected = build_expected_files(
         config,
@@ -497,10 +600,54 @@ def main():
         "MISSING_VARIABLE": 0,
         "EMPTY_VARIABLE": 0,
         "NAN": 0,
+        "NAN_FIRST_DATE": 0,
         "READ_ERROR": 0,
         "TIMEOUT": 0,
         "CRASH": 0,
     }
+
+    inspected = 0
+
+    # StartDate-1: the one date whose NaN is expected rather than suspicious.
+    first_date_tag = f".{date_list[0]}_{config['OverpassTime'].replace(':', '')}." if date_list else None
+
+    # Whether to flag it turns on one question: has this face been processed?
+    #
+    # No marker means it has not, so flagging that file is how it gets built
+    # fresh -- which is the point of a one-off sweep before processing.
+    #
+    # A marker means the overpass stage completed and wrote it deliberately.
+    # Flagging it then would delete a correct file and, because deleting
+    # overpass output retires the marker, reprocess the whole window. Worse on
+    # a face that has since been pruned: the OutputDir needed to rebuild it is
+    # gone by design, so the deletion is not recoverable.
+    #
+    # --allow-nan-first-date forces the exemption on regardless.
+    # --flag-nan-first-date wins over both. Without it there is no way to ask
+    # for that file to be rebuilt once a marker exists, because the marker
+    # turns the exemption on by itself: the flags could only ever force it on
+    # harder. Wanting a clean rebuild rather than a resume is a legitimate
+    # thing to ask for, and it needs a way to say so.
+    overpass_marker = read_stage_marker(run_dirs, "overpass", str(config["StartDate"]))
+    exempt_first_date = (
+        args.allow_nan_first_date or overpass_marker is not None
+    ) and not args.flag_nan_first_date
+
+    if first_date_tag:
+        if exempt_first_date:
+            reason = "--allow-nan-first-date" if args.allow_nan_first_date \
+                     else f"overpass marker S{overpass_marker} present"
+            print(
+                f"StartDate-1 ({date_list[0]}): NaN expected, not flagged"
+                f"  [{reason}]",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"StartDate-1 ({date_list[0]}): no overpass marker, so it will"
+                f" be flagged for rebuilding",
+                file=sys.stderr,
+            )
 
     inspected = 0
 
@@ -534,10 +681,22 @@ def main():
             file_path = futures[future]
             status, detail = future.result()
 
+            # NaN in the StartDate-1 file is how that date is supposed to look:
+            # only the part covered by UTC StartDate can be filled. Counted
+            # under its own name so it stays visible rather than being quietly
+            # folded into COMPLETE.
+            if (
+                exempt_first_date
+                and status == "NAN"
+                and first_date_tag
+                and first_date_tag in os.path.basename(file_path)
+            ):
+                status = "NAN_FIRST_DATE"
+
             counts[status] = counts.get(status, 0) + 1
             inspected += 1
 
-            if status != "COMPLETE":
+            if status not in ("COMPLETE", "NAN_FIRST_DATE"):
                 # stdout is the deletion list, and nothing else.
                 print(file_path)
                 sys.stdout.flush()
@@ -560,11 +719,21 @@ def main():
                     flush=True,
                 )
 
-    incomplete = sum(
+    # Exactly the statuses the loop above prints, so the count and the list
+    # cannot disagree. NAN_FIRST_DATE belongs with COMPLETE here: that file is
+    # partly NaN by construction and is deliberately not flagged. Counting it
+    # as printed reported "Printed for deletion: 5" on a run that printed
+    # nothing, which reads as a lost deletion list rather than a quiet face.
+    printed = sum(
         count
         for status, count in counts.items()
-        if status not in ("COMPLETE", "MISSING")
+        if status not in ("COMPLETE", "NAN_FIRST_DATE")
     )
+
+    # Still separate from `printed`: a missing file is not deleted -- there is
+    # nothing to delete -- but it does mean the face has work outstanding, and
+    # the exit code below has to say so.
+    incomplete = printed - counts["MISSING"]
 
     print(
         "\nSummary:"
@@ -574,10 +743,12 @@ def main():
         f"\n  Missing variables:     {counts['MISSING_VARIABLE']}"
         f"\n  Empty variables:       {counts['EMPTY_VARIABLE']}"
         f"\n  Containing NaN:        {counts['NAN']}"
+        f"\n  NaN, StartDate-1:      {counts['NAN_FIRST_DATE']} (expected, not flagged)"
         f"\n  Read errors:           {counts['READ_ERROR']}"
         f"\n  Read timeouts:         {counts['TIMEOUT']}"
         f"\n  Reader crashes:        {counts['CRASH']}"
-        f"\n  Printed for deletion:  {incomplete}",
+        f"\n  Printed for deletion:  {incomplete}"
+        f"\n  (MISSING is not printed: there is no file to delete)",
         file=sys.stderr,
         flush=True,
     )

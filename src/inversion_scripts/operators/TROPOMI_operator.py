@@ -208,6 +208,20 @@ def apply_average_tropomi_operator(
             time_varname = "time"
     all_strdate = [gridcell[time_varname] for gridcell in obs_mapped_to_gc]
     all_strdate = list(set(all_strdate))
+
+    # to remove observations at or after EndDate, which is exclusive
+    end_date_str = str(config["EndDate"])
+
+    beyond_end = [d for d in all_strdate if d[:8] >= end_date_str]
+
+    if beyond_end:
+        all_strdate = [d for d in all_strdate if d[:8] < end_date_str]
+        print(
+            f"Skipping {len(beyond_end)} timestamp(s) at or after EndDate "
+            f"{end_date_str}: {sorted(beyond_end)[:4]}"
+            f"{' ...' if len(beyond_end) > 4 else ''}",
+            flush=True,
+        )
     
     for strdate in all_strdate:
         gridcell_dict = obs_mapped_to_gc[obs_mapped_to_gc[time_varname] == strdate]

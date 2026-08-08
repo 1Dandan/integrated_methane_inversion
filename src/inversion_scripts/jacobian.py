@@ -142,23 +142,16 @@ if __name__ == "__main__":
     shared_end = f"{shared_end_date[0:4]}-{shared_end_date[4:6]}-{shared_end_date[6:8]} 23:59:59"
 
     # A granule dated D carries observations whose local date is D or D-1,
-    # because local time is UTC + lon/15 and lon spans [-180, 180).
+    # since local time is UTC + lon/15 and lon spans [-180, 180). Sampling
+    # local date L needs data for both L and L+1, so while the runs are still
+    # advancing the last usable local date is shared_end_date - 2: a granule
+    # dated shared_end_date - 1 would ask for a date that does not exist yet.
     #
-    # Without SatDiagOperator the operator reads OutputDir, which holds every
-    # UTC date through shared_end_date - 1, so granules run that far.
-    #
-    # With SatDiagOperator it reads one overpass file per local date instead,
-    # and overpass output stops at its last local date: shared_end_date - 2
-    # while the runs are still advancing, because sampling local date L needs
-    # OutputDir for both L and L+1. A granule dated shared_end_date - 1 would
-    # then ask for an overpass file that cannot exist yet. Once
-    # shared_end_date reaches EndDate there is no further day to wait for, and
-    # the two cases coincide. This mirrors build_date_list in
-    # calculate_satellite_overpass_diagnostics.py.
-    shared_end_offset = 1
-
-    if config.get("SatDiagOperator", False) and shared_end_date != str(endday):
-        shared_end_offset = 2
+    # Once shared_end_date reaches EndDate there is no further day to wait
+    # for, and one day back is enough. Mirrors local_end_exclusive_for in
+    # calculate_satellite_overpass_diagnostics.py, so the two cannot disagree
+    # about where the window ends.
+    shared_end_offset = 1 if shared_end_date == str(endday) else 2
 
     gc_shared_enddate = np.datetime64(
         datetime.datetime.strptime(shared_end, "%Y-%m-%d %H:%M:%S")
