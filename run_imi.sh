@@ -259,7 +259,7 @@ fi
 if [ "${PruneOutputDir:-false}" = "true" ] && ! "$KalmanMode"; then
     printf "\n=== PRUNING OUTPUTDIR ===\n"
 
-    python -u src/utilities/prune_outputdir.py "$ConfigFile" \
+    python -u ${InversionPath}/src/utilities/prune_outputdir.py "$ConfigPath" \
         --execute \
         --record-deleted "${RunDirs}/outputdir_pruned_keys.txt" \
         || printf "\nPrune did not run; see the reason above. Continuing.\n"

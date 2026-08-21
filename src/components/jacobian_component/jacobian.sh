@@ -792,14 +792,26 @@ calculate_overpass_diagnostics() {
 
         rm -f "$overpass_status" "$overpass_log"
 
-        sbatch --mem "$RequestedMemory" \
-            -c "$RequestedCPUs" \
-            -t "$RequestedTime" \
-            -p "$SchedulerPartition" \
+        # Overpass and inversion are both postprocessing and want the same
+        # resources, so they share one set of settings.
+        InvMem="${InversionMemory:-$RequestedMemory}"
+        InvCPU="${InversionCPUs:-$RequestedCPUs}"
+        InvTime="${InversionTime:-$RequestedTime}"
+        InvPartition="${InvSchedulerPartition:-$SchedulerPartition}"
+
+        # HDF5_USE_FILE_LOCKING: the POSIX locks HDF5 takes are unreliable on
+        # network filesystems, and these workers open GEOS-Chem output on
+        # Lustre in parallel. Set on this sbatch rather than exported, so it
+        # reaches this job and not the Jacobian runs.
+        sbatch --mem "$InvMem" \
+            -c "$InvCPU" \
+            -t "$InvTime" \
+            -p "$InvPartition" \
+            --export=ALL,HDF5_USE_FILE_LOCKING=FALSE \
             -J "overpass_diag" \
             -o "$overpass_log" \
             -W \
-            --wrap "python ${InversionPath}/src/inversion_scripts/calculate_satellite_overpass_diagnostics.py ${ConfigPath} ${nElements} ${prevCPUs}"
+            --wrap "python ${InversionPath}/src/inversion_scripts/calculate_satellite_overpass_diagnostics.py ${ConfigPath} ${nElements} ${InvCPU}"
         rc=$?
 
         cat "$overpass_log" >> "${RunDirs}/imi_output.log"

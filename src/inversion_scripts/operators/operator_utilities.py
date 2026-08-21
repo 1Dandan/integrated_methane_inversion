@@ -2,7 +2,6 @@ import os
 import numpy as np
 import xarray as xr
 import pandas as pd
-import signal
 import warnings
 import subprocess
 import re
@@ -531,36 +530,12 @@ def create_SCRIP_grid(TROPOMI, sat_ind, save_pth):
     if save_pth is not None:
         print(f"Saving file {save_pth}")
         enc = {v: {"zlib": True, "complevel": 1} for v in SCRIP_ds.data_vars}
-        # Write then rename: the caller caches on existence alone, so a partial
-        # file left by a killed job would be reused forever.
-        tmp_pth = f"{save_pth}.tmp"
-        SCRIP_ds.to_netcdf(tmp_pth, encoding=enc)
-        os.replace(tmp_pth, save_pth)
+        SCRIP_ds.to_netcdf(save_pth, encoding=enc)
 
-def _reset_child_signals():
-    """Hand a clean signal state to the launcher, run just before exec.
-
-    Two things survive exec: the signal mask, and any disposition set to
-    SIG_IGN. joblib forks its workers, so whatever it blocks or ignores is
-    inherited by every process started from one.
-
-    srun reaps its step child on SIGCHLD. Start it with SIGCHLD blocked and the
-    child exits, becomes a zombie, and srun waits on a notification that never
-    arrives -- the step reports COMPLETED with exit 0:0 while srun itself never
-    returns, so the weights are written but never renamed into place.
-    """
-    signal.pthread_sigmask(signal.SIG_SETMASK, set())
-
-    for signum in (signal.SIGCHLD, signal.SIGPIPE, signal.SIGINT, signal.SIGTERM):
-        try:
-            if signal.getsignal(signum) == signal.SIG_IGN:
-                signal.signal(signum, signal.SIG_DFL)
-        except (OSError, ValueError):
-            pass
 
 
 def create_ESMF_regridding_weights(TROPOMI, filename, sat_ind, CSgridDir, gridspec_path,
-                                   debug=False, force=False, n_dst=None):
+                                   debug=False):
     """Generate the regridding weights from TROPOMI grids to GCHP grids
 
     Args:
@@ -569,10 +544,6 @@ def create_ESMF_regridding_weights(TROPOMI, filename, sat_ind, CSgridDir, gridsp
         sat_ind (array): filtered satellite indices
         CSgridDir (str): directory path to CS_grids
         gridspec_path (str): file path to simulation gridspec file
-        force (bool): discard the cached SCRIP grid and weights and rebuild
-        n_dst (int): destination cell count. Given, a run whose launcher hangs
-            after finishing can have its output validated and kept rather than
-            thrown away; omitted, such a run simply fails.
     """
 
     # create SCRIP grid file
@@ -581,15 +552,6 @@ def create_ESMF_regridding_weights(TROPOMI, filename, sat_ind, CSgridDir, gridsp
 
     SCRIP_grid_fpath = f"{date}_SCRIP_grid.nc"
     regrid_weight_fpath = f"{date}_regrid_weights.nc"
-
-    # Both files are cached on existence alone, so a damaged one is never
-    # rebuilt on its own. force is how the caller discards a bad pair; the
-    # SCRIP grid goes too, since it may be what made the weights bad.
-    if force:
-        for stale in (SCRIP_grid_fpath, regrid_weight_fpath):
-            stale_path = os.path.join(CSgridDir, stale)
-            if os.path.exists(stale_path):
-                os.remove(stale_path)
 
     # check if SCRIP grid file exists
     if not os.path.exists(os.path.join(CSgridDir, SCRIP_grid_fpath)):
@@ -602,172 +564,27 @@ def create_ESMF_regridding_weights(TROPOMI, filename, sat_ind, CSgridDir, gridsp
             os.environ["ESMF_LOGLEVEL"] = "DEBUG"
             os.environ["ESMF_LOGKIND"]  = "MULTI"
             os.environ["ESMF_RUNTIME_PROFILE"] = "ON"
+        ncores = int(os.environ.get("SLURM_NTASKS", "1"))
         print(f"Running ESMF_RegridWeightGen for {date}...")
-
-        # Decide launcher
-        #
-        # ESMF_REGRID_LAUNCHER overrides the choice: "srun", "mpirun", or
-        # "none" to exec it directly. At one rank no launcher is required, and
-        # "none" sidesteps a scheduler whose step handling misbehaves under many
-        # concurrent workers. A high-resolution destination grid is the case for
-        # srun, where distributing one granule across ranks actually pays.
-        LAUNCHER = os.environ.get("ESMF_REGRID_LAUNCHER")
-
-        if not LAUNCHER:
-            if "SLURM_JOB_ID" in os.environ:
-                LAUNCHER = "srun"
-            else:
-                LAUNCHER = "mpirun"
-
-        # Ranks per granule. One by default, and deliberately not SLURM_NTASKS:
-        # these run inside jacobian.py's Parallel(n_jobs=-1), so N ranks times
-        # 48 workers asks the allocation for 48N tasks. Raising this only helps
-        # if n_jobs comes down to match.
-        ntasks = os.environ.get("ESMF_REGRID_NTASKS", "1")
-
-        # Which PMI srun should use. pmix is common but not universal; set to
-        # "none" to omit the flag and let Slurm choose.
-        mpi_flavour = os.environ.get("ESMF_REGRID_MPI", "pmix")
-
-        # Build base command
-        if LAUNCHER == "none":
-            cmd = []
-        elif LAUNCHER == "srun":
-            cmd = [LAUNCHER]
-
-            # --overlap lets these steps share the job's resources. Without it
-            # each step reserves them, so concurrent workers serialise and the
-            # rest sit in "Job step creation temporarily disabled, retrying".
-            #
-            # It needs Slurm 20.11 or newer. An older scheduler rejects the
-            # option outright and every granule fails, so set
-            # ESMF_REGRID_OVERLAP=0 there; the runs then serialise, which is
-            # what this code did before the flag was added.
-            if os.environ.get("ESMF_REGRID_OVERLAP", "1") != "0":
-                cmd.append("--overlap")
-
-            if mpi_flavour and mpi_flavour != "none":
-                cmd.append(f"--mpi={mpi_flavour}")
-
-            cmd += ["-n", ntasks]
+        if "SLURM_JOB_ID" in os.environ:
+            LAUNCHER = "srun"
         else:
-            cmd = [LAUNCHER, "-n", ntasks]
-
-        # Write to a temporary name and rename on success. This file is cached
-        # on existence alone, so a partial one left by a killed job is reused
-        # forever: its `row` reads back as the netCDF int fill (-2147483647),
-        # and `row - 1` then trips scipy with "negative axis 0 index".
-        #
-        # An orphaned .tmp means a previous attempt was killed. It is never
-        # read, but it is cleared here so ESMF cannot object to writing over
-        # it and so the orphans do not accumulate across reruns.
-        tmp_weight_fpath = f"{regrid_weight_fpath}.tmp"
-        tmp_weight_full = os.path.join(CSgridDir, tmp_weight_fpath)
-
-        if os.path.exists(tmp_weight_full):
-            os.remove(tmp_weight_full)
-
-        # Common options
-        cmd += [
+            LAUNCHER = "mpirun"
+        subprocess.run([
+            LAUNCHER, "-n", str(ncores),
             "ESMF_RegridWeightGen",
             "-s", SCRIP_grid_fpath,
             "-d", gridspec_path,
             "-m", "conserve",
             "--ignore_unmapped",
-            "-w", tmp_weight_fpath
-        ]
-
-        # Every worker runs with cwd=CSgridDir and ESMF writes its PET log into
-        # the working directory, so all of them target one PET0 file. Under a
-        # launcher that serialised the runs that was merely useless; running
-        # them concurrently it is contention, and ESMF aborts on processor 0.
-        #
-        # Set ESMF_REGRID_LOG=1 to keep the logs when diagnosing a single
-        # granule. Do not leave it on for a parallel run.
-        if os.environ.get("ESMF_REGRID_LOG") != "1":
-            cmd.append("--no_log")
-
-        # Output is captured rather than discarded. When this fails the only
-        # evidence left on disk is an unrenamed .tmp, and discarding stderr
-        # made a nonzero srun indistinguishable from one still waiting for a
-        # step. srun's "Job step creation temporarily disabled" goes here too.
-        # The timeout is the backstop. ESMF finishes a granule in seconds, so
-        # anything near this is wedged rather than slow, and without it a
-        # single hung launcher silently consumes the whole job's wall time.
-        timeout_s = float(os.environ.get("ESMF_REGRID_TIMEOUT", "1800"))
-
-        try:
-            result = subprocess.run(
-                cmd,
-                cwd=CSgridDir,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=timeout_s,
-                preexec_fn=_reset_child_signals,
-            )
-        except subprocess.TimeoutExpired as expired:
-            # A launcher can fail to return after its work is done: srun reaps
-            # its step child on SIGCHLD, and an inherited blocked mask leaves it
-            # waiting on a notification that never arrives. sacct shows the step
-            # COMPLETED 0:0 while srun itself never exits -- and the weights are
-            # already on disk.
-            #
-            # So look before discarding. Adopted only if it passes the same
-            # checks a cached file must pass, which is what separates "the
-            # launcher hung after finishing" from "it hung part-way through".
-            if n_dst is not None and os.path.exists(tmp_weight_full):
-                try:
-                    read_regrid_weights(tmp_weight_full, n_dst)
-                except Exception:
-                    pass
-                else:
-                    os.replace(
-                        tmp_weight_full,
-                        os.path.join(CSgridDir, regrid_weight_fpath),
-                    )
-                    print(
-                        f"WARNING: the launcher for {date} did not return "
-                        f"within {timeout_s:g}s, but its output is complete "
-                        f"and has been kept. Check for a wedged launcher.",
-                        flush=True,
-                    )
-                    return regrid_weight_fpath
-
-            raise RuntimeError(
-                f"ESMF_RegridWeightGen for {date} did not return within "
-                f"{timeout_s:g}s and was killed; {tmp_weight_fpath} left in "
-                f"place and is not usable.\ncommand: {' '.join(cmd)}"
-                f"\nIf the launcher is hanging with a defunct child, try "
-                f"ESMF_REGRID_LAUNCHER=none."
-                f"\noutput so far:\n{(expired.output or b'') if isinstance(expired.output, bytes) else (expired.output or '(none)')}"
-            ) from expired
-
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"ESMF_RegridWeightGen failed for {date} "
-                f"(exit {result.returncode}); {tmp_weight_fpath} left in place."
-                f"\ncommand: {' '.join(cmd)}"
-                f"\nTo see ESMF's traceback, rerun this one command by hand "
-                f"from {CSgridDir} with ESMF_REGRID_LOG=1 and read "
-                f"PET0.RegridWeightGen.Log."
-                f"\noutput:\n{result.stdout.strip() or '(none)'}"
-            )
-
-        # Reached only on exit 0, so a missing file here means ESMF reported
-        # success without writing anything.
-        if not os.path.exists(tmp_weight_full):
-            raise RuntimeError(
-                f"ESMF_RegridWeightGen reported success for {date} but wrote "
-                f"no {tmp_weight_fpath}"
-                f"\noutput:\n{result.stdout.strip() or '(none)'}"
-            )
-
-        os.replace(
-            tmp_weight_full,
-            os.path.join(CSgridDir, regrid_weight_fpath),
+            "-w", regrid_weight_fpath
+            ],
+            check=True, cwd=CSgridDir,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
     return regrid_weight_fpath
+
 
 def read_regrid_weights(weight_path, n_dst):
     """Read one ESMF weight file, rejecting it if the indices are unusable.
@@ -812,8 +629,7 @@ def get_overlap_area_CSgrid(TROPOMI, filename, sat_ind, CSgridDir,
 
     # create regridding weights first
     regrid_weight_fpath = create_ESMF_regridding_weights(TROPOMI, filename, sat_ind,
-                                                         CSgridDir, gridspec_path,
-                                                         n_dst=n_dst)
+                                                         CSgridDir, gridspec_path)
     weight_path = os.path.join(CSgridDir, regrid_weight_fpath)
 
     try:
@@ -827,9 +643,18 @@ def get_overlap_area_CSgrid(TROPOMI, filename, sat_ind, CSgridDir,
             f"Rebuilding unusable regridding weights {regrid_weight_fpath}: {error}",
             flush=True,
         )
+        # Both files are cached on existence alone, so a damaged one is never
+        # rebuilt on its own. The SCRIP grid goes too: it may be what made the
+        # weights bad.
+        for stale in (f"{os.path.splitext(regrid_weight_fpath)[0]}.nc",
+                      regrid_weight_fpath.replace("_regrid_weights.nc",
+                                                  "_SCRIP_grid.nc")):
+            stale_path = os.path.join(CSgridDir, stale)
+            if os.path.exists(stale_path):
+                os.remove(stale_path)
+
         regrid_weight_fpath = create_ESMF_regridding_weights(
             TROPOMI, filename, sat_ind, CSgridDir, gridspec_path,
-            force=True, n_dst=n_dst,
         )
         src_ind, dst_ind, regrid_weights, dst_area = read_regrid_weights(
             os.path.join(CSgridDir, regrid_weight_fpath), n_dst

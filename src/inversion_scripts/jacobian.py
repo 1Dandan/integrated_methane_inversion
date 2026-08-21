@@ -266,7 +266,9 @@ if __name__ == "__main__":
         else:
             return (date, "cached")
 
-    results = Parallel(n_jobs=-1)(delayed(process)(filename) for filename in sat_files)
+    results = Parallel(n_jobs=-1)(
+        delayed(process)(filename) for filename in sat_files
+    )
     print(f"Wrote files to {outputdir}")
 
     # Record that data_converted covers [startday, shared_end_date). Only the

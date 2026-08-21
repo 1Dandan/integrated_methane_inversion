@@ -82,11 +82,6 @@ MARKER_RE = re.compile(
 
 MANIFEST_NAME = "outputdir_pruned.json"
 
-# What this file was called before. T005 already carries one, and its record of
-# what was pruned is worth keeping rather than restarting, so it is read as a
-# fallback and removed once the new name has been written.
-LEGACY_MANIFEST_NAME = ".outputdir_pruned.json"
-
 REPO_ROOT = os.path.dirname(
     os.path.dirname(
         os.path.dirname(os.path.abspath(__file__))
@@ -394,24 +389,20 @@ def collect_deletable(run_dirs, run_name, cutoff_date):
 
 
 def read_manifest(run_dirs):
-    for name in (MANIFEST_NAME, LEGACY_MANIFEST_NAME):
-        path = os.path.join(run_dirs, name)
+    path = os.path.join(run_dirs, MANIFEST_NAME)
 
-        if not os.path.isfile(path):
-            continue
+    if not os.path.isfile(path):
+        return None
 
-        try:
-            with open(path) as handle:
-                return json.load(handle)
-        except (OSError, ValueError):
-            return None
-
-    return None
+    try:
+        with open(path) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
 
 
 def write_manifest(run_dirs, cutoff_date, deleted_count, timestamp):
     path = os.path.join(run_dirs, MANIFEST_NAME)
-    legacy = os.path.join(run_dirs, LEGACY_MANIFEST_NAME)
 
     previous = read_manifest(run_dirs) or {"history": []}
 
@@ -424,10 +415,6 @@ def write_manifest(run_dirs, cutoff_date, deleted_count, timestamp):
 
     with open(path, "w") as handle:
         json.dump(previous, handle, indent=2)
-
-    # Only after the new file is on disk, so an interruption never loses both.
-    if os.path.isfile(legacy):
-        os.remove(legacy)
 
 
 def process_face(config_path, args, timestamp):
@@ -514,10 +501,6 @@ def process_face(config_path, args, timestamp):
         return "skipped"
 
     # ---- record only ----
-    # The local deletion happened in an earlier pass that ran with
-    # --defer-manifest. This call marks the face pruned now that the objects
-    # are confirmed gone from the bucket too, which is the point at which the
-    # claim becomes true.
     if args.record_manifest_only:
         write_manifest(run_dirs, cutoff_date, 0, timestamp)
         report("RECORDED", f"manifest set to cutoff {cutoff_date}")
@@ -693,19 +676,10 @@ def process_face(config_path, args, timestamp):
     for path in deletable:
         os.remove(path)
 
-    # The manifest is what stops a second pass repeating this work, so it must
-    # not claim more than has actually happened. Deleting the local files is
-    # only half of a prune -- the objects still have to go from the bucket, and
-    # that is a later step in a different script which can fail on its own.
-    #
-    # Writing the manifest here regardless meant a face whose upload step died
-    # came back, read "already pruned through <cutoff>", emitted an empty
-    # deletion list, and was reported a success with its OutputDir still in the
-    # bucket. Nothing was lost, but nothing was pruned either, and a retry
-    # could never fix it.
-    #
-    # With --defer-manifest the caller writes it once the bucket side is
-    # confirmed, via --record-manifest-only.
+    # The manifest must not claim more than has happened: deleting the local
+    # files is only half a prune where the bucket does not follow on its own.
+    # With --defer-manifest the caller records it via --record-manifest-only
+    # once the objects are confirmed gone.
     if not args.defer_manifest:
         write_manifest(
             run_dirs,

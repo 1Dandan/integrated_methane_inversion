@@ -2,6 +2,7 @@
 import sys
 import os
 import glob
+import resource
 import tempfile
 import shutil
 import numpy as np
@@ -392,9 +393,6 @@ def _presave_one_date(
     """Read one date's met fields and write them to tmp_dir as .npy.
 
     Returns (date_str, paths) with paths None for a date outside the window.
-    Split out of presave_met_arrays so the dates can be read in parallel:
-    each one opens a different file and writes different outputs, so there is
-    nothing shared to serialise on.
     """
     date_dt = datetime.strptime(date_str, "%Y%m%d")
 
@@ -451,10 +449,7 @@ def presave_met_arrays(
     ordered = sorted(required_dates)
     args = (utc_start, utc_end, JacobianRunDirs, RunName, run_id, prefix, tmp_dir)
 
-    # The first in-window date is read here, alone, to find out how large one
-    # date actually is on this grid. Everything after it runs in a pool sized
-    # from that measurement. Guessing instead would mean picking a number that
-    # is either wasteful at C36 or fatal at C360.
+    # One date alone first, to size the pool from what it measures.
     saved_met = {}
     measured_mb = None
     rest = []
@@ -468,18 +463,15 @@ def presave_met_arrays(
             break
 
     if rest:
-        # Two dates are live at once in the step that follows -- a date and the
-        # one after it -- alongside the simulation output being read against
-        # them. OVERPASS_MEM_FACTOR scales the measurement to cover that.
-        factor = float(os.environ.get("OVERPASS_MEM_FACTOR", "6"))
-        per_worker = int(measured_mb * factor) if measured_mb else None
+        # A presave worker opens one file and writes two arrays out of it, well
+        # under what the main loop holds. OVERPASS_PRESAVE_MEM_PER_WORKER_MB
+        # overrides; measured at a few hundred MB.
+        per_worker = int(
+            os.environ.get("OVERPASS_PRESAVE_MEM_PER_WORKER_MB", "1500")
+        )
 
         pool = memory_capped_workers(n_workers, per_worker)
-        if measured_mb:
-            print(
-                f"Met arrays are {measured_mb} MB/date; "
-                f"presaving {len(rest)} more date(s) on {pool} worker(s)"
-            )
+        print(f"Presave: ~{per_worker} MB/worker; {len(rest)} date(s) on {pool} worker(s)")
 
         saved_met.update(
             dict(
@@ -1118,12 +1110,12 @@ def process_run_day(
         )
 
 
-def slurm_memory_budget_mb():
-    """The job's memory allocation in MB, or None when not under Slurm.
+def memory_budget_mb():
+    """How much memory this process may use, in MB.
 
-    This is the number the job is killed against, so it is the one worth
-    respecting -- not the machine's total memory, which on a shared node
-    belongs to other people too.
+    Slurm exports the allocation, so a job submitted with --mem needs nothing
+    configured. Outside Slurm, physical memory: no cap at all is the one
+    outcome worth avoiding.
     """
     per_node = os.environ.get("SLURM_MEM_PER_NODE")
     if per_node and per_node.isdigit():
@@ -1136,7 +1128,12 @@ def slurm_memory_budget_mb():
     if per_cpu and per_cpu.isdigit() and cpus and cpus.isdigit():
         return int(per_cpu) * int(cpus)
 
-    return None
+    try:
+        return (
+            os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        ) // (1024 * 1024)
+    except (ValueError, OSError, AttributeError):
+        return None
 
 
 def met_arrays_mb(paths):
@@ -1150,45 +1147,36 @@ def met_arrays_mb(paths):
     return max(1, total // (1024 * 1024))
 
 
+
 def memory_capped_workers(requested, per_worker_mb=None):
     """Lower the worker count to what the memory allocation will hold.
 
-    Each worker holds a date's met fields and the run output it is reading, so
-    peak memory scales with how many run at once. With plenty of memory this
-    binds on nothing; inside a small allocation it is the difference between
-    finishing and being killed part-way, which on this step means losing the
-    whole face's diagnostics.
-
-    The per-worker figure should be measured rather than assumed: the arrays
-    are a couple of hundred MB at C36 and two orders of magnitude larger at
-    C360, so a constant that suits one resolution is dangerously wrong at the
-    other. Callers pass what they measured; OVERPASS_MEM_PER_WORKER_MB
-    overrides it, and 0 disables the cap.
+    per_worker_mb is measured by the caller, not assumed: the inputs vary by
+    two orders of magnitude across grids and by a factor of ten across faces
+    with the state vector size.
     """
-    override = os.environ.get("OVERPASS_MEM_PER_WORKER_MB")
-    if override is not None and override.strip().isdigit():
-        per_worker = int(override)
-        if per_worker <= 0:
-            return requested
-    elif per_worker_mb:
-        per_worker = per_worker_mb
-    else:
+    if not per_worker_mb:
         return requested
 
-    budget = slurm_memory_budget_mb()
+    per_worker = per_worker_mb
+
+    budget = memory_budget_mb()
     if budget is None:
         return requested
 
-    # Leave the parent its own share: it holds the datasets that get handed
-    # to every worker, and it is still resident while they run.
-    usable = max(0, budget - max(2000, budget // 10))
+    # For the parent, and for loky's copies in flight. Raise it if a face is
+    # still OOM-killed: per_worker is a file-size estimate, not measured RSS.
+    headroom_pct = int(os.environ.get("OVERPASS_MEM_HEADROOM_PCT", "10"))
+    headroom_pct = min(90, max(0, headroom_pct))
+
+    usable = max(0, budget - max(4000, budget * headroom_pct // 100))
     allowed = max(1, usable // per_worker)
 
     if allowed < requested:
         print(
             f"Limiting to {allowed} worker(s): {budget} MB allocated, "
             f"~{per_worker} MB per worker "
-            f"(OVERPASS_MEM_PER_WORKER_MB to change)"
+            f"(OVERPASS_MEM_HEADROOM_PCT to change the margin)"
         )
         return allowed
 
@@ -1199,8 +1187,7 @@ def split_dates(date_list, n_chunks):
     """Split date_list into at most n_chunks contiguous, near-equal pieces.
 
     Contiguous rather than round-robin: consecutive dates read neighbouring
-    files, and one worker walking a run of them is kinder to the filesystem
-    than several interleaving across the whole year.
+    files.
     """
     if n_chunks <= 1 or len(date_list) <= 1:
         return [date_list]
@@ -1253,6 +1240,21 @@ def process_run_dates(
             lon_name,
             lat_name,
             DisableRun0000,
+        )
+
+    # Silent unless a worker approaches what the pool was sized for. Measured at
+    # ~4.9 GB on C36 faces, but that is a property of the grid and the state
+    # vector, so a different resolution would need a different figure -- and the
+    # first sign of one too low is an OOM kill partway through the face.
+    peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    assumed_mb = int(os.environ.get("OVERPASS_MEM_PER_WORKER_MB", "6000"))
+
+    if peak_mb > 0.85 * assumed_mb:
+        print(
+            f"WARNING: run {run_i:04d} peak RSS {peak_mb:.0f} MB against an "
+            f"assumed {assumed_mb} MB per worker; raise "
+            f"OVERPASS_MEM_PER_WORKER_MB",
+            flush=True,
         )
 
 
@@ -1380,13 +1382,8 @@ def calculate_satellite_overpass_diagnostics(
         prefix="overpass_met_"
     )
 
-    # n_workers is a joblib convention: -1 means every core, -2 all but one.
-    # Both the chunk arithmetic and the message below need a real count.
-    #
-    # "Every core" means every core of the allocation, not of the machine.
-    # joblib.cpu_count() reports the latter, so on a shared node -1 would open
-    # 112 workers against 48 allocated cores and spend the difference in
-    # context switching.
+    # -1 means every core of the allocation, not of the machine:
+    # joblib.cpu_count() reports the latter, which on a shared node is wrong.
     slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
     n_cores = (
         int(slurm_cpus)
@@ -1411,32 +1408,20 @@ def calculate_satellite_overpass_diagnostics(
             n_workers=n_workers,
         )
 
-        # Reuse what the prologue measured. process_run_day holds a date and
-        # the one after it, plus the simulation output read against them, so
-        # it is the heavier of the two steps -- if either is going to exhaust
-        # the allocation it is this one.
-        sample = next(
-            (v["current"] for v in met_paths.values() if v.get("current")),
-            None,
-        )
-        measured_mb = met_arrays_mb(sample)
-        if measured_mb:
-            factor = float(os.environ.get("OVERPASS_MEM_FACTOR", "6"))
-            effective_workers = memory_capped_workers(
-                effective_workers, int(measured_mb * factor)
-            )
-            n_workers = effective_workers
+        # Measured rather than derived: ~4.8 GB/worker, and a constant is
+        # reasonable because every run but a face's last carries 200 state
+        # vector elements regardless of the face. The input files are far
+        # larger and irrelevant -- xarray lazy-loads, so a worker holds
+        # selected variables at one time index, never a whole file.
+        per_worker_mb = int(os.environ.get("OVERPASS_MEM_PER_WORKER_MB", "6000"))
 
-        # Tasks are (run, slice of dates), not (run) alone. A face with one
-        # Jacobian run used to produce exactly one task, so every core beyond
-        # the first sat idle no matter what n_jobs said.
-        #
-        # Chunks rather than one task per date: loky pickles every argument to
-        # every task, and overpass_ds and pert_simulations_dict go to each one.
-        # Aiming at a few times n_workers keeps all the cores fed while paying
-        # that cost tens of times rather than thousands.
-        # Higher balances the load better; lower pickles the shared arguments
-        # fewer times. Four is a starting point, not a measured optimum.
+        print(f"Per worker: ~{per_worker_mb} MB (OVERPASS_MEM_PER_WORKER_MB)")
+
+        effective_workers = memory_capped_workers(effective_workers, per_worker_mb)
+        n_workers = effective_workers
+
+        # Chunks rather than one task per date: loky pickles every argument
+        # to every task, and overpass_ds goes to each one.
         chunk_factor = int(os.environ.get("OVERPASS_CHUNK_FACTOR", "4"))
         n_chunks = max(
             1,

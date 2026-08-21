@@ -623,11 +623,8 @@ def main():
     # gone by design, so the deletion is not recoverable.
     #
     # --allow-nan-first-date forces the exemption on regardless.
-    # --flag-nan-first-date wins over both. Without it there is no way to ask
-    # for that file to be rebuilt once a marker exists, because the marker
-    # turns the exemption on by itself: the flags could only ever force it on
-    # harder. Wanting a clean rebuild rather than a resume is a legitimate
-    # thing to ask for, and it needs a way to say so.
+    # --flag-nan-first-date wins over both: a marker turns the exemption on by
+    # itself, so without it a clean rebuild cannot be asked for.
     overpass_marker = read_stage_marker(run_dirs, "overpass", str(config["StartDate"]))
     exempt_first_date = (
         args.allow_nan_first_date or overpass_marker is not None
@@ -720,19 +717,14 @@ def main():
                 )
 
     # Exactly the statuses the loop above prints, so the count and the list
-    # cannot disagree. NAN_FIRST_DATE belongs with COMPLETE here: that file is
-    # partly NaN by construction and is deliberately not flagged. Counting it
-    # as printed reported "Printed for deletion: 5" on a run that printed
-    # nothing, which reads as a lost deletion list rather than a quiet face.
+    # cannot disagree.
     printed = sum(
         count
         for status, count in counts.items()
         if status not in ("COMPLETE", "NAN_FIRST_DATE")
     )
 
-    # Still separate from `printed`: a missing file is not deleted -- there is
-    # nothing to delete -- but it does mean the face has work outstanding, and
-    # the exit code below has to say so.
+    # A missing file is not deleted, but it does mean work is outstanding.
     incomplete = printed - counts["MISSING"]
 
     print(

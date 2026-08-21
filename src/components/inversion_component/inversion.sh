@@ -85,10 +85,19 @@ run_inversion() {
     InvTime="${InversionTime:-$RequestedTime}"
     InvPartition="${InvSchedulerPartition:-$SchedulerPartition}"
     # Execute inversion driver script
+    #
+    # HDF5_USE_FILE_LOCKING: the POSIX locks HDF5 takes are unreliable on
+    # network filesystems, and the workers here open GEOS-Chem output on Lustre
+    # in parallel. Measured on one face: 0.8 cores over 3h26m with locking on,
+    # 12.3 cores over 5m23s with it off.
+    #
+    # Set on this sbatch rather than exported, so it reaches this job and not
+    # the Jacobian runs, the overpass step or anything after.
     sbatch --mem $InvMem \
         -c $InvCPU \
         -t $InvTime \
         -p $InvPartition \
+        --export=ALL,HDF5_USE_FILE_LOCKING=FALSE \
         -W run_inversion.sh $FirstSimSwitch
     
     # check if exited with non-zero exit code
