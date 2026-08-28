@@ -785,6 +785,18 @@ calculate_overpass_diagnostics() {
     printf "\n=== CALCULATING OVERPASS DIAGNOSTICS ===\n"
     
     overpass_start=$(date +%s)
+
+    # nElements is assigned in setup_imi, so a run with RunSetup off leaves it
+    # empty. The argument list below then shifts and the step reads InvCPU as
+    # the element count, writing output for a handful of elements and exiting
+    # 0. OptimizeBCs and OptimizeOH only ever add to the state vector count.
+    sv_elements=$(ncmax StateVector ${RunDirs}/StateVector.nc)
+    if [ -z "${nElements:-}" ] || [ "$nElements" -lt "$sv_elements" ]; then
+        printf "\nnElements is '%s' but %s holds %s state vector elements.\n" \
+            "${nElements:-}" "${RunDirs}/StateVector.nc" "$sv_elements"
+        imi_failed $LINENO
+    fi
+
     if "$UseSlurm"; then
         
         overpass_log="${RunDirs}/imi_output_overpass.tmp"
@@ -803,6 +815,9 @@ calculate_overpass_diagnostics() {
         # network filesystems, and these workers open GEOS-Chem output on
         # Lustre in parallel. Set on this sbatch rather than exported, so it
         # reaches this job and not the Jacobian runs.
+        # || rc=$? rather than a bare call: the ERR trap would otherwise fire on
+        # the sbatch line itself and none of the reporting below would run.
+        rc=0
         sbatch --mem "$InvMem" \
             -c "$InvCPU" \
             -t "$InvTime" \
@@ -811,13 +826,17 @@ calculate_overpass_diagnostics() {
             -J "overpass_diag" \
             -o "$overpass_log" \
             -W \
-            --wrap "python ${InversionPath}/src/inversion_scripts/calculate_satellite_overpass_diagnostics.py ${ConfigPath} ${nElements} ${InvCPU}"
-        rc=$?
+            --wrap "python ${InversionPath}/src/inversion_scripts/calculate_satellite_overpass_diagnostics.py ${ConfigPath} ${nElements} ${InvCPU}" || rc=$?
 
-        cat "$overpass_log" >> "${RunDirs}/imi_output.log"
+        if [ -f "$overpass_log" ]; then
+            cat "$overpass_log"
+            cat "$overpass_log" >> "${RunDirs}/imi_output.log"
+        else
+            printf "\nNo %s was written: Slurm never opened the job's output file.\n" "$overpass_log"
+        fi
 
         if [ "$rc" -ne 0 ]; then
-            printf "\nOverpass diagnostics Slurm job failed with exit code %s. See:\n%s\n" "$rc" "$overpass_log"
+            printf "\nOverpass diagnostics Slurm job failed with exit code %s.\n" "$rc"
             imi_failed $LINENO
         fi
 
