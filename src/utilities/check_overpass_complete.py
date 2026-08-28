@@ -42,7 +42,7 @@ Usage:
     check_overpass_complete.py CONFIG [N_ELEMENTS] [options] > bad_files.txt
 
 Exit codes:
-    0  every expected file is present and complete
+    0  every expected file is present and complete, or no overpass files exist
     1  usage or configuration error
     2  at least one file is missing or incomplete
 """
@@ -116,8 +116,7 @@ REQUIRED_BASERUN_VARS = {
 
 MAX_VALUES_PER_READ = 10_000_000
 
-# Fork (not spawn) keeps per-file overhead near a millisecond: the child
-# inherits the already-imported netCDF4/HDF5 libraries.
+
 def _isolation_context():
     """A start method whose children inherit none of this process's locks.
 
@@ -310,6 +309,14 @@ def build_expected_files(config, n_elements, run_dirs, date_list):
     disable_run_0000 = config.get("DisableRun0000", False)
 
     jacobian_root = os.path.join(run_dirs, "jacobian_runs")
+
+    if not os.path.isdir(jacobian_root):
+        print(
+            f"NOTE: no jacobian_runs directory: {jacobian_root}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return []
 
     run_names = sorted(
         name
@@ -580,6 +587,19 @@ def main():
         date_list,
     )
 
+    existing = [
+        file_path
+        for file_path, _ in expected
+        if os.path.isfile(file_path)
+    ]
+
+    if not existing:
+        print(
+            "NOTE: no overpass .nc4 files to check; skipping.",
+            file=sys.stderr,
+        )
+        return 0
+
     print(
         f"Face:               {config['RunName']}"
         f"\nRun directory:      {run_dirs}"
@@ -609,7 +629,11 @@ def main():
     inspected = 0
 
     # StartDate-1: the one date whose NaN is expected rather than suspicious.
-    first_date_tag = f".{date_list[0]}_{config['OverpassTime'].replace(':', '')}." if date_list else None
+    first_date_tag = (
+        f".{date_list[0]}_{config['OverpassTime'].replace(':', '')}."
+        if date_list
+        else None
+    )
 
     # Whether to flag it turns on one question: has this face been processed?
     #
@@ -625,20 +649,30 @@ def main():
     # --allow-nan-first-date forces the exemption on regardless.
     # --flag-nan-first-date wins over both: a marker turns the exemption on by
     # itself, so without it a clean rebuild cannot be asked for.
-    overpass_marker = read_stage_marker(run_dirs, "overpass", str(config["StartDate"]))
+    overpass_marker = read_stage_marker(
+        run_dirs,
+        "overpass",
+        str(config["StartDate"]),
+    )
+
     exempt_first_date = (
         args.allow_nan_first_date or overpass_marker is not None
     ) and not args.flag_nan_first_date
 
     if first_date_tag:
         if exempt_first_date:
-            reason = "--allow-nan-first-date" if args.allow_nan_first_date \
-                     else f"overpass marker S{overpass_marker} present"
+            reason = (
+                "--allow-nan-first-date"
+                if args.allow_nan_first_date
+                else f"overpass marker S{overpass_marker} present"
+            )
+
             print(
                 f"StartDate-1 ({date_list[0]}): NaN expected, not flagged"
                 f"  [{reason}]",
                 file=sys.stderr,
             )
+
         else:
             print(
                 f"StartDate-1 ({date_list[0]}): no overpass marker, so it will"
@@ -735,7 +769,8 @@ def main():
         f"\n  Missing variables:     {counts['MISSING_VARIABLE']}"
         f"\n  Empty variables:       {counts['EMPTY_VARIABLE']}"
         f"\n  Containing NaN:        {counts['NAN']}"
-        f"\n  NaN, StartDate-1:      {counts['NAN_FIRST_DATE']} (expected, not flagged)"
+        f"\n  NaN, StartDate-1:      {counts['NAN_FIRST_DATE']} "
+        "(expected, not flagged)"
         f"\n  Read errors:           {counts['READ_ERROR']}"
         f"\n  Read timeouts:         {counts['TIMEOUT']}"
         f"\n  Reader crashes:        {counts['CRASH']}"

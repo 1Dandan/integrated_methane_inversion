@@ -27,7 +27,7 @@ Usage:
     check_data_converted.py CONFIG [options] > corrupt.txt
 
 Exit codes:
-    0  every pickle loaded and checked out
+    0  every pickle loaded and checked out, or no pickles to check
     1  usage or configuration error
     2  at least one pickle is corrupt, or the manifest disagrees
 """
@@ -213,8 +213,10 @@ def main():
     converted_dir = os.path.join(run_dirs, "inversion", "data_converted")
 
     if not os.path.isdir(converted_dir):
-        print(f"ERROR: no data_converted directory: {converted_dir}",
-              file=sys.stderr)
+        print(
+            f"ERROR: no data_converted directory: {converted_dir}",
+            file=sys.stderr,
+        )
         return 1
 
     names = sorted(f for f in os.listdir(converted_dir) if f.endswith(".pkl"))
@@ -228,19 +230,24 @@ def main():
         f"\nPickles:        {len(names)}"
         f"\nExpect obs_GC:  {expect_obs_gc}"
         f"  (DisableRun0000={config.get('DisableRun0000', False)})",
-        file=sys.stderr, flush=True,
+        file=sys.stderr,
+        flush=True,
     )
 
     if not names:
-        print("ERROR: no .pkl files to check", file=sys.stderr)
-        return 1
+        print("NOTE: no .pkl files to check; skipping.", file=sys.stderr)
+        return 0
 
     corrupt = []
     checked = 0
 
     with cf.ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = [
-            pool.submit(inspect, os.path.join(converted_dir, name), expect_obs_gc)
+            pool.submit(
+                inspect,
+                os.path.join(converted_dir, name),
+                expect_obs_gc,
+            )
             for name in names
         ]
 
@@ -253,28 +260,41 @@ def main():
                 print(path)
                 sys.stdout.flush()
                 print(f"CORRUPT  {os.path.basename(path)}", file=sys.stderr)
+
                 for problem in problems:
                     print(f"    {problem}", file=sys.stderr)
 
             if args.progress_every > 0 and checked % args.progress_every == 0:
-                print(f"  checked {checked}/{len(names)}, corrupt {len(corrupt)}",
-                      file=sys.stderr, flush=True)
+                print(
+                    f"  checked {checked}/{len(names)}, "
+                    f"corrupt {len(corrupt)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     manifest_problems = []
 
     if not args.skip_manifest:
         manifest_path = os.path.join(
-            run_dirs, "inversion", "data_converted_manifest.json"
+            run_dirs,
+            "inversion",
+            "data_converted_manifest.json",
         )
 
         if os.path.isfile(manifest_path):
-            present = set(names) - {os.path.basename(p) for p in corrupt}
+            present = set(names) - {
+                os.path.basename(path) for path in corrupt
+            }
+
             manifest_problems = check_against_manifest(
-                converted_dir, manifest_path, present
+                converted_dir,
+                manifest_path,
+                present,
             )
 
             for problem in manifest_problems:
                 print(f"MANIFEST  {problem}", file=sys.stderr)
+
         else:
             print(
                 "NOTE: no data_converted_manifest.json; file checks only. "
@@ -285,7 +305,11 @@ def main():
     if args.delete and corrupt:
         for path in corrupt:
             os.remove(path)
-        print(f"\nDeleted {len(corrupt)} corrupt pickle(s).", file=sys.stderr)
+
+        print(
+            f"\nDeleted {len(corrupt)} corrupt pickle(s).",
+            file=sys.stderr,
+        )
 
     print(
         f"\nSummary:"

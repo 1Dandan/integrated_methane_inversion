@@ -2,14 +2,13 @@
 import sys
 import os
 import glob
-import resource
+import gc
 import tempfile
 import shutil
 import numpy as np
 import xarray as xr
 import yaml
 from datetime import datetime, timedelta
-import joblib
 from joblib import Parallel, delayed
 from contextlib import ExitStack
 
@@ -37,6 +36,10 @@ warnings.filterwarnings(
     message="Duplicate dimension names present.*"
 )
 
+os.environ.setdefault("JOBLIB_TEMP_FOLDER", "/tmp")
+# filterwarnings applies to this process only; the joblib workers start fresh
+# and inherit the environment instead.
+os.environ["PYTHONWARNINGS"] = "ignore:Duplicate dimension names present"
 MwAir = 28.97  # g/mol
 
 
@@ -370,7 +373,7 @@ def get_keepvars(
 # ---------------------------------------------------------------------------
 def load_met_fields(met_file):
     """Return AirDen and BxH arrays from a SpeciesConc file."""
-    with xr.open_dataset(met_file) as met_ds:
+    with xr.open_dataset(met_file, drop_variables="anchor", cache=False) as met_ds:
         AirDen = met_ds["Met_AIRDEN"].values * 1e3
         BxH = met_ds["Met_BXHEIGHT"].values
 
@@ -428,7 +431,6 @@ def presave_met_arrays(
     RunName,
     tmp_dir,
     DisableRun0000=False,
-    n_workers=1,
 ):
     """Pre-save each required UTC met date once for memory-mapped access."""
     if DisableRun0000:
@@ -446,52 +448,30 @@ def presave_met_arrays(
             (date_dt + timedelta(days=1)).strftime("%Y%m%d")
         )
 
-    ordered = sorted(required_dates)
-    args = (utc_start, utc_end, JacobianRunDirs, RunName, run_id, prefix, tmp_dir)
+    args = (
+        utc_start,
+        utc_end,
+        JacobianRunDirs,
+        RunName,
+        run_id,
+        prefix,
+        tmp_dir,
+    )
 
-    # One date alone first, to size the pool from what it measures.
-    saved_met = {}
-    measured_mb = None
-    rest = []
-
-    for i, date_str in enumerate(ordered):
-        date_str, paths = _presave_one_date(date_str, *args)
-        saved_met[date_str] = paths
-        if paths is not None:
-            measured_mb = met_arrays_mb(paths)
-            rest = ordered[i + 1:]
-            break
-
-    if rest:
-        # A presave worker opens one file and writes two arrays out of it, well
-        # under what the main loop holds. OVERPASS_PRESAVE_MEM_PER_WORKER_MB
-        # overrides; measured at a few hundred MB.
-        per_worker = int(
-            os.environ.get("OVERPASS_PRESAVE_MEM_PER_WORKER_MB", "1500")
-        )
-
-        pool = memory_capped_workers(n_workers, per_worker)
-        print(f"Presave: ~{per_worker} MB/worker; {len(rest)} date(s) on {pool} worker(s)")
-
-        saved_met.update(
-            dict(
-                Parallel(
-                    n_jobs=pool,
-                    backend="loky",
-                    pre_dispatch="2*n_jobs",
-                )(
-                    delayed(_presave_one_date)(date_str, *args)
-                    for date_str in rest
-                )
-            )
-        )
+    # Keep this stage serial. There are usually fewer met dates than worker
+    # slots, and a long FSx read can otherwise leave loky workers idle long
+    # enough to time out before the main parallel stage starts.
+    saved_met = dict(
+        _presave_one_date(date_str, *args)
+        for date_str in sorted(required_dates)
+    )
 
     met_paths = {}
 
     for date_str in date_list:
-        date_dt = datetime.strptime(date_str, "%Y%m%d")
         next_date_str = (
-            date_dt + timedelta(days=1)
+            datetime.strptime(date_str, "%Y%m%d")
+            + timedelta(days=1)
         ).strftime("%Y%m%d")
 
         met_paths[date_str] = {
@@ -518,78 +498,79 @@ def compute_overpass_columns(
     day_offset,
 ):
     """Sample CH4 columns at satellite overpass time."""
-    n_vars = len(keepvars)
-    spatial_shape = closest_hour.shape
-
     overpass_CH4_col = np.full(
-        (n_vars, *spatial_shape),
+        (len(keepvars), *closest_hour.shape),
         np.nan,
         dtype=np.float32,
     )
 
-    if (
-        sim_utc_ds is not None
-        and AirDen is not None
-        and BxH is not None
-    ):
-        valid0 = day_offset == 0
+    def build_samples(AirDen, BxH, offset):
+        if AirDen is None or BxH is None:
+            return []
 
-        for hr in np.unique(closest_hour[valid0]):
-            hr_int = int(hr)
-            mask = valid0 & (closest_hour == hr)
+        valid = day_offset == offset
+        samples = []
 
-            col_weight = (
-                AirDen[hr_int][:, mask]
-                / MwAir
-                * BxH[hr_int][:, mask]
-            )
+        for hr in np.unique(closest_hour[valid]):
+            hr = int(hr)
+            mask = valid & (closest_hour == hr)
+            weight = AirDen[hr][:, mask] / MwAir * BxH[hr][:, mask]
+            samples.append((hr, mask, weight))
 
-            for i, var in enumerate(keepvars):
-                if var not in sim_utc_ds:
-                    continue
+        return samples
 
-                ch4 = (
-                    sim_utc_ds[var]
-                    .isel(time=hr_int)
-                    .values[:, mask]
-                )
+    samples0 = build_samples(AirDen, BxH, 0)
+    samples1 = build_samples(AirDen_nextday, BxH_nextday, 1)
 
+    # Load one tracer at a time, but only the UTC hours actually needed for
+    # this local overpass date. This keeps the original hourly sampling while
+    # avoiding both repeated per-hour reads and unused hours from either day.
+    hours0 = [hr for hr, _, _ in samples0]
+    hours1 = [hr for hr, _, _ in samples1]
+
+    for i, var in enumerate(keepvars):
+        if sim_utc_ds is not None and var in sim_utc_ds and hours0:
+            try:
+                ch4 = sim_utc_ds[var].isel(time=hours0).values
+            except Exception as exc:
+                source = sim_utc_ds.encoding.get("source", "<unknown file>")
+                raise RuntimeError(
+                    f"Failed reading SpeciesConc data\n"
+                    f"  file: {source}\n"
+                    f"  variable: {var}\n"
+                    f"  time indices: {hours0}"
+                ) from exc
+
+            for j, (_, mask, weight) in enumerate(samples0):
                 overpass_CH4_col[i, mask] = (
-                    ch4 * col_weight
+                    ch4[j][:, mask] * weight
                 ).sum(axis=0)
 
-    if (
-        sim_utc_ds_nextday is not None
-        and AirDen_nextday is not None
-        and BxH_nextday is not None
-    ):
-        valid1 = day_offset == 1
+            del ch4
 
-        for hr in np.unique(closest_hour[valid1]):
-            hr_int = int(hr)
-            mask = valid1 & (closest_hour == hr)
-
-            col_weight = (
-                AirDen_nextday[hr_int][:, mask]
-                / MwAir
-                * BxH_nextday[hr_int][:, mask]
-            )
-
-            for i, var in enumerate(keepvars):
-                if var not in sim_utc_ds_nextday:
-                    continue
-
-                ch4 = (
-                    sim_utc_ds_nextday[var]
-                    .isel(time=hr_int)
-                    .values[:, mask]
+        if sim_utc_ds_nextday is not None and var in sim_utc_ds_nextday and hours1:
+            try:
+                ch4 = sim_utc_ds_nextday[var].isel(time=hours1).values
+            except Exception as exc:
+                source = sim_utc_ds_nextday.encoding.get(
+                    "source", "<unknown file>"
                 )
+                raise RuntimeError(
+                    f"Failed reading next-day SpeciesConc data\n"
+                    f"  file: {source}\n"
+                    f"  variable: {var}\n"
+                    f"  time indices: {hours1}"
+                ) from exc
 
+            for j, (_, mask, weight) in enumerate(samples1):
                 overpass_CH4_col[i, mask] = (
-                    ch4 * col_weight
+                    ch4[j][:, mask] * weight
                 ).sum(axis=0)
+
+            del ch4
 
     return overpass_CH4_col
+
 
 
 def sample_overpass_3D(
@@ -625,24 +606,29 @@ def sample_overpass_3D(
     if sim_utc_ds_nextday is not None:
         all_vars.update(sim_utc_ds_nextday.data_vars)
 
+    valid0 = day_offset == 0
+    valid1 = day_offset == 1
+    masks0 = [
+        (int(hr), valid0 & (closest_hour == hr))
+        for hr in np.unique(closest_hour[valid0])
+    ]
+    masks1 = [
+        (int(hr), valid1 & (closest_hour == hr))
+        for hr in np.unique(closest_hour[valid1])
+    ]
+    hours0 = [hr for hr, _ in masks0]
+    hours1 = [hr for hr, _ in masks1]
+
     for var in sorted(all_vars):
-        if (
-            sim_utc_ds is not None
-            and var in sim_utc_ds
-        ):
+        if sim_utc_ds is not None and var in sim_utc_ds:
             src_da = sim_utc_ds[var]
-
-        elif (
-            sim_utc_ds_nextday is not None
-            and var in sim_utc_ds_nextday
-        ):
+        elif sim_utc_ds_nextday is not None and var in sim_utc_ds_nextday:
             src_da = sim_utc_ds_nextday[var]
-
         else:
             continue
 
         if "time" not in src_da.dims:
-            out_ds[var] = src_da
+            out_ds[var] = src_da.load()
             continue
 
         if src_da.dims[0] != "time":
@@ -652,16 +638,9 @@ def sample_overpass_3D(
             )
 
         out_dims = tuple(src_da.dims[1:])
+        out_shape = tuple(src_da.sizes[d] for d in out_dims)
 
-        out_shape = tuple(
-            src_da.sizes[d]
-            for d in out_dims
-        )
-
-        if (
-            tuple(out_dims[-len(spatial_dims):])
-            != tuple(spatial_dims)
-        ):
+        if tuple(out_dims[-len(spatial_dims):]) != tuple(spatial_dims):
             continue
 
         sampled = np.full(
@@ -670,41 +649,17 @@ def sample_overpass_3D(
             dtype=np.float32,
         )
 
-        if (
-            sim_utc_ds is not None
-            and var in sim_utc_ds
-        ):
-            valid0 = day_offset == 0
+        if sim_utc_ds is not None and var in sim_utc_ds and hours0:
+            arr = sim_utc_ds[var].isel(time=hours0).values
+            for j, (_, mask) in enumerate(masks0):
+                sampled[..., mask] = arr[j][..., mask]
+            del arr
 
-            for hr in np.unique(closest_hour[valid0]):
-                hr_int = int(hr)
-                mask = valid0 & (closest_hour == hr)
-
-                arr = (
-                    sim_utc_ds[var]
-                    .isel(time=hr_int)
-                    .values
-                )
-
-                sampled[..., mask] = arr[..., mask]
-
-        if (
-            sim_utc_ds_nextday is not None
-            and var in sim_utc_ds_nextday
-        ):
-            valid1 = day_offset == 1
-
-            for hr in np.unique(closest_hour[valid1]):
-                hr_int = int(hr)
-                mask = valid1 & (closest_hour == hr)
-
-                arr = (
-                    sim_utc_ds_nextday[var]
-                    .isel(time=hr_int)
-                    .values
-                )
-
-                sampled[..., mask] = arr[..., mask]
+        if sim_utc_ds_nextday is not None and var in sim_utc_ds_nextday and hours1:
+            arr = sim_utc_ds_nextday[var].isel(time=hours1).values
+            for j, (_, mask) in enumerate(masks1):
+                sampled[..., mask] = arr[j][..., mask]
+            del arr
 
         out_ds[var] = xr.DataArray(
             sampled,
@@ -718,6 +673,7 @@ def sample_overpass_3D(
         )
 
     return out_ds
+
 
 
 def sample_baserun_file_type(
@@ -755,7 +711,7 @@ def sample_baserun_file_type(
     with ExitStack() as stack:
         ds_current = (
             stack.enter_context(
-                xr.open_dataset(file_current)
+                xr.open_dataset(file_current, drop_variables="anchor", cache=False)
             )
             if os.path.isfile(file_current)
             else None
@@ -763,7 +719,7 @@ def sample_baserun_file_type(
 
         ds_next = (
             stack.enter_context(
-                xr.open_dataset(file_next)
+                xr.open_dataset(file_next, drop_variables="anchor", cache=False)
             )
             if os.path.isfile(file_next)
             else None
@@ -1058,7 +1014,7 @@ def process_run_day(
     with ExitStack() as stack:
         sim_utc_ds = (
             stack.enter_context(
-                xr.open_dataset(sim_file_utc)
+                xr.open_dataset(sim_file_utc, drop_variables="anchor", cache=False)
             )
             if current_met is not None
             else None
@@ -1066,7 +1022,7 @@ def process_run_day(
 
         sim_utc_ds_nextday = (
             stack.enter_context(
-                xr.open_dataset(sim_file_utc_nextday)
+                xr.open_dataset(sim_file_utc_nextday, drop_variables="anchor", cache=False)
             )
             if next_met is not None
             else None
@@ -1110,104 +1066,8 @@ def process_run_day(
         )
 
 
-def memory_budget_mb():
-    """How much memory this process may use, in MB.
-
-    Slurm exports the allocation, so a job submitted with --mem needs nothing
-    configured. Outside Slurm, physical memory: no cap at all is the one
-    outcome worth avoiding.
-    """
-    per_node = os.environ.get("SLURM_MEM_PER_NODE")
-    if per_node and per_node.isdigit():
-        return int(per_node)
-
-    per_cpu = os.environ.get("SLURM_MEM_PER_CPU")
-    cpus = os.environ.get("SLURM_CPUS_PER_TASK") or os.environ.get(
-        "SLURM_JOB_CPUS_PER_NODE"
-    )
-    if per_cpu and per_cpu.isdigit() and cpus and cpus.isdigit():
-        return int(per_cpu) * int(cpus)
-
-    try:
-        return (
-            os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-        ) // (1024 * 1024)
-    except (ValueError, OSError, AttributeError):
-        return None
-
-
-def met_arrays_mb(paths):
-    """Size of one date's presaved met arrays, in MB, or None if unreadable."""
-    if not paths:
-        return None
-    try:
-        total = os.path.getsize(paths["AirDen"]) + os.path.getsize(paths["BxH"])
-    except (OSError, KeyError, TypeError):
-        return None
-    return max(1, total // (1024 * 1024))
-
-
-
-def memory_capped_workers(requested, per_worker_mb=None):
-    """Lower the worker count to what the memory allocation will hold.
-
-    per_worker_mb is measured by the caller, not assumed: the inputs vary by
-    two orders of magnitude across grids and by a factor of ten across faces
-    with the state vector size.
-    """
-    if not per_worker_mb:
-        return requested
-
-    per_worker = per_worker_mb
-
-    budget = memory_budget_mb()
-    if budget is None:
-        return requested
-
-    # For the parent, and for loky's copies in flight. Raise it if a face is
-    # still OOM-killed: per_worker is a file-size estimate, not measured RSS.
-    headroom_pct = int(os.environ.get("OVERPASS_MEM_HEADROOM_PCT", "10"))
-    headroom_pct = min(90, max(0, headroom_pct))
-
-    usable = max(0, budget - max(4000, budget * headroom_pct // 100))
-    allowed = max(1, usable // per_worker)
-
-    if allowed < requested:
-        print(
-            f"Limiting to {allowed} worker(s): {budget} MB allocated, "
-            f"~{per_worker} MB per worker "
-            f"(OVERPASS_MEM_HEADROOM_PCT to change the margin)"
-        )
-        return allowed
-
-    return requested
-
-
-def split_dates(date_list, n_chunks):
-    """Split date_list into at most n_chunks contiguous, near-equal pieces.
-
-    Contiguous rather than round-robin: consecutive dates read neighbouring
-    files.
-    """
-    if n_chunks <= 1 or len(date_list) <= 1:
-        return [date_list]
-
-    n_chunks = min(n_chunks, len(date_list))
-    size, extra = divmod(len(date_list), n_chunks)
-
-    chunks = []
-    start = 0
-    for i in range(n_chunks):
-        stop = start + size + (1 if i < extra else 0)
-        chunks.append(date_list[start:stop])
-        start = stop
-
-    return chunks
-
-
-def process_run_dates(
-    run_i,
-    date_list,
+def process_task_batch(
+    task_batch,
     met_paths,
     config,
     n_elements,
@@ -1222,40 +1082,34 @@ def process_run_dates(
     lat_name,
     DisableRun0000=False,
 ):
-    """Process all requested dates for one Jacobian run."""
-    for date_str in date_list:
-        process_run_day(
-            run_i,
-            date_str,
-            met_paths[date_str],
-            config,
-            n_elements,
-            JacobianRunDirs,
-            pert_simulations_dict,
-            overpass_ds,
-            closest_hour,
-            day_offset,
-            dims,
-            coords,
-            lon_name,
-            lat_name,
-            DisableRun0000,
-        )
+    """Process several (run, date) pairs inside one loky worker task."""
+    for run_i, date_str in task_batch:
+        try:
+            process_run_day(
+                run_i,
+                date_str,
+                met_paths[date_str],
+                config,
+                n_elements,
+                JacobianRunDirs,
+                pert_simulations_dict,
+                overpass_ds,
+                closest_hour,
+                day_offset,
+                dims,
+                coords,
+                lon_name,
+                lat_name,
+                DisableRun0000,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Overpass processing failed:\n"
+                f"  Jacobian run: {run_i:04d}\n"
+                f"  local overpass date: {date_str}"
+            ) from exc
 
-    # Silent unless a worker approaches what the pool was sized for. Measured at
-    # ~4.9 GB on C36 faces, but that is a property of the grid and the state
-    # vector, so a different resolution would need a different figure -- and the
-    # first sign of one too low is an OOM kill partway through the face.
-    peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-    assumed_mb = int(os.environ.get("OVERPASS_MEM_PER_WORKER_MB", "6000"))
-
-    if peak_mb > 0.85 * assumed_mb:
-        print(
-            f"WARNING: run {run_i:04d} peak RSS {peak_mb:.0f} MB against an "
-            f"assumed {assumed_mb} MB per worker; raise "
-            f"OVERPASS_MEM_PER_WORKER_MB",
-            flush=True,
-        )
+        gc.collect()
 
 
 # ---------------------------------------------------------------------------
@@ -1271,10 +1125,7 @@ def calculate_satellite_overpass_diagnostics(
     OutputPath = os.path.expandvars(config["OutputPath"])
     DisableRun0000 = config.get("DisableRun0000", False)
 
-    if DisableRun0000:
-        start_run_num = 1
-    else:
-        start_run_num = 0
+    start_run_num = 1 if DisableRun0000 else 0
 
     JacobianRunDirs = os.path.join(
         OutputPath,
@@ -1289,9 +1140,6 @@ def calculate_satellite_overpass_diagnostics(
     start, end, date_list, shared_end_date = build_date_list(config)
     StartDate = str(config["StartDate"])
 
-    # Returned before the grid is loaded and before any OutputDir file is
-    # touched. A face whose OutputDir has been pruned has nothing left to read,
-    # so reaching further would fail on inputs that are gone by design.
     if not date_list:
         existing = read_stage_marker(
             os.path.join(OutputPath, RunName),
@@ -1299,9 +1147,6 @@ def calculate_satellite_overpass_diagnostics(
             StartDate,
         )
 
-        # A marker ahead of the current shared end date means the checkpoints
-        # S is derived from went backwards. What it records still happened, so
-        # rewriting it downward would discard a true claim; leave it and say so.
         if existing is not None and existing > shared_end_date:
             print(
                 f"WARNING: marker S{existing} is ahead of the current shared "
@@ -1340,17 +1185,9 @@ def calculate_satellite_overpass_diagnostics(
     Jacobian_RunDir_list = [
         name
         for name in os.listdir(JacobianRunDirs)
-        if os.path.isdir(
-            os.path.join(JacobianRunDirs, name)
-        )
+        if os.path.isdir(os.path.join(JacobianRunDirs, name))
     ]
 
-    # Run indices are read from the directory names rather than inferred from
-    # how many directories there are. The two agree only when the runs are
-    # numbered from zero: with DisableRun0000 the directories are
-    # _0001.._000N, so a count used as an exclusive range bound stops at N-1
-    # and silently skips the last run. Reading the names is also unaffected by
-    # any unrelated directory sitting alongside the runs.
     run_indices = sorted(
         run_i
         for run_i in (
@@ -1378,25 +1215,27 @@ def calculate_satellite_overpass_diagnostics(
         n_elements,
     )
 
-    tmp_dir = tempfile.mkdtemp(
-        prefix="overpass_met_"
-    )
+    tmp_dir = tempfile.mkdtemp(prefix="overpass_met_")
 
-    # -1 means every core of the allocation, not of the machine:
-    # joblib.cpu_count() reports the latter, which on a shared node is wrong.
     slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
     n_cores = (
         int(slurm_cpus)
         if slurm_cpus and slurm_cpus.isdigit()
-        else joblib.cpu_count()
+        else (os.cpu_count() or 1)
     )
 
-    effective_workers = (
-        n_workers if n_workers > 0 else max(1, n_cores + 1 + n_workers)
-    )
-    n_workers = effective_workers
+    if n_workers < 0:
+        n_workers = max(1, n_cores + 1 + n_workers)
+    elif n_workers == 0:
+        raise ValueError("n_workers cannot be 0")
+
+    print(f"Using {n_workers} worker(s)")
 
     try:
+        # Prepare shared AirDen/BxH before creating the loky pool.
+        # With DisableRun0000=True these come from the small BaseSpeciesConc
+        # files in run 0001, so this serial stage should be quick.
+        print("Preparing meteorology")
         met_paths = presave_met_arrays(
             date_list,
             start,
@@ -1405,46 +1244,35 @@ def calculate_satellite_overpass_diagnostics(
             RunName,
             tmp_dir,
             DisableRun0000,
-            n_workers=n_workers,
         )
 
-        # Measured rather than derived: ~4.8 GB/worker, and a constant is
-        # reasonable because every run but a face's last carries 200 state
-        # vector elements regardless of the face. The input files are far
-        # larger and irrelevant -- xarray lazy-loads, so a worker holds
-        # selected variables at one time index, never a whole file.
-        per_worker_mb = int(os.environ.get("OVERPASS_MEM_PER_WORKER_MB", "6000"))
-
-        print(f"Per worker: ~{per_worker_mb} MB (OVERPASS_MEM_PER_WORKER_MB)")
-
-        effective_workers = memory_capped_workers(effective_workers, per_worker_mb)
-        n_workers = effective_workers
-
-        # Chunks rather than one task per date: loky pickles every argument
-        # to every task, and overpass_ds goes to each one.
-        chunk_factor = int(os.environ.get("OVERPASS_CHUNK_FACTOR", "4"))
-        n_chunks = max(
-            1,
-            -(-(chunk_factor * effective_workers) // max(1, len(run_indices))),
-        )
-        date_chunks = split_dates(date_list, n_chunks)
+        # Give each loky worker one task containing several (run, date) pairs.
+        # Round-robin assignment spreads the heavier base-run dates across
+        # workers while avoiding loky worker recycling between individual dates.
+        tasks = [
+            (run_i, date_str)
+            for run_i in run_indices
+            for date_str in date_list
+        ]
+        n_workers = min(n_workers, len(tasks))
+        task_batches = [
+            tasks[i::n_workers]
+            for i in range(n_workers)
+        ]
 
         print(
-            f"Parallel over {len(run_indices)} run(s) x "
-            f"{len(date_chunks)} date chunk(s) "
-            f"= {len(run_indices) * len(date_chunks)} task(s) "
-            f"on {effective_workers} worker(s)"
+            f"Processing {len(run_indices)} run(s) x "
+            f"{len(date_list)} date(s) = {len(tasks)} task(s) "
+            f"in {len(task_batches)} worker batch(es)"
         )
 
         Parallel(
-            n_jobs=n_workers,
+            n_jobs=len(task_batches),
             backend="loky",
             batch_size=1,
-            pre_dispatch="2*n_jobs",
         )(
-            delayed(process_run_dates)(
-                run_i,
-                date_chunk,
+            delayed(process_task_batch)(
+                task_batch,
                 met_paths,
                 config,
                 n_elements,
@@ -1459,13 +1287,9 @@ def calculate_satellite_overpass_diagnostics(
                 lat_name,
                 DisableRun0000,
             )
-            for run_i in run_indices
-            for date_chunk in date_chunks
+            for task_batch in task_batches
         )
 
-        # Reached only when every run and date above completed. Missing
-        # OutputDir inputs now raise, so a marker cannot cover a date that
-        # was silently written as all-NaN.
         write_stage_marker(
             os.path.join(OutputPath, RunName),
             "overpass",

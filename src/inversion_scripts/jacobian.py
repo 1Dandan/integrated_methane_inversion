@@ -266,9 +266,39 @@ if __name__ == "__main__":
         else:
             return (date, "cached")
 
-    results = Parallel(n_jobs=-1)(
-        delayed(process)(filename) for filename in sat_files
-    )
+    # Give each worker one contiguous batch of granules. This keeps loky from
+    # recycling workers between individual TROPOMI files, while preserving
+    # parallel processing and temporal/file locality.
+    if sat_files:
+        n_workers = min(
+            int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1)),
+            len(sat_files),
+        )
+        file_batches = [
+            batch.tolist()
+            for batch in np.array_split(sat_files, n_workers)
+            if len(batch)
+        ]
+
+        def process_batch(filenames):
+            return [process(filename) for filename in filenames]
+
+        batch_results = Parallel(
+            n_jobs=len(file_batches),
+            backend="loky",
+            batch_size=1,
+        )(
+            delayed(process_batch)(filenames)
+            for filenames in file_batches
+        )
+
+        results = [
+            result
+            for batch in batch_results
+            for result in batch
+        ]
+    else:
+        results = []
     print(f"Wrote files to {outputdir}")
 
     # Record that data_converted covers [startday, shared_end_date). Only the
