@@ -435,6 +435,26 @@ def spherical_excess_area(ll, ul, ur, lr, radius=6371000.):
     area = (a1 + a2 + a3 + a4 - 2.*np.pi) * radius * radius
     return area
 
+def valid_SCRIP_grid(path):
+    if not os.path.exists(path):
+        return False
+
+    required = {
+        "grid_dims",
+        "grid_center_lat",
+        "grid_center_lon",
+        "grid_corner_lat",
+        "grid_corner_lon",
+        "grid_imask",
+        "grid_area"
+    }
+
+    try:
+        with Dataset(path) as ds:
+            return required.issubset(ds.variables)
+    except Exception:
+        return False
+    
 def create_SCRIP_grid(TROPOMI, sat_ind, save_pth):
     FILLF = np.float32(-9999.0)
     FILLI = np.int32(-9999)
@@ -533,9 +553,7 @@ def create_SCRIP_grid(TROPOMI, sat_ind, save_pth):
         SCRIP_ds.to_netcdf(save_pth, encoding=enc)
 
 
-
-def create_ESMF_regridding_weights(TROPOMI, filename, sat_ind, CSgridDir, gridspec_path,
-                                   debug=False):
+def create_ESMF_regridding_weights(TROPOMI, filename, sat_ind, CSgridDir, gridspec_path):
     """Generate the regridding weights from TROPOMI grids to GCHP grids
 
     Args:
@@ -554,16 +572,21 @@ def create_ESMF_regridding_weights(TROPOMI, filename, sat_ind, CSgridDir, gridsp
     regrid_weight_fpath = f"{date}_regrid_weights.nc"
 
     # check if SCRIP grid file exists
-    if not os.path.exists(os.path.join(CSgridDir, SCRIP_grid_fpath)):
-        create_SCRIP_grid(TROPOMI, sat_ind, os.path.join(CSgridDir, SCRIP_grid_fpath))
+    SCRIP_path = os.path.join(CSgridDir, SCRIP_grid_fpath)
+    if not valid_SCRIP_grid(SCRIP_path):
+        if os.path.exists(SCRIP_path):
+            print(f"Removing invalid SCRIP grid: {SCRIP_path}")
+            os.remove(SCRIP_path)
 
+        create_SCRIP_grid(
+            TROPOMI,
+            sat_ind,
+            SCRIP_path,
+        )
+    
     # check if regridding weights file exists
+    #   to debug, just comment out stdout and stderr
     if not os.path.exists(os.path.join(CSgridDir, regrid_weight_fpath)):
-        if debug:
-            os.environ["ESMF_LOGFILE"] = "stdout"
-            os.environ["ESMF_LOGLEVEL"] = "DEBUG"
-            os.environ["ESMF_LOGKIND"]  = "MULTI"
-            os.environ["ESMF_RUNTIME_PROFILE"] = "ON"
         ncores = int(os.environ.get("SLURM_NTASKS", "1"))
         print(f"Running ESMF_RegridWeightGen for {date}...")
         if "SLURM_JOB_ID" in os.environ:
