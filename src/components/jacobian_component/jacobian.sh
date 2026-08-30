@@ -626,8 +626,17 @@ run_jacobian() {
 
                 # Loop through directories starting with 'project_'
                 for dir in ${RunDirs}/jacobian_runs/${RunName}_*; do
-                    echo "set run duration and checkpoint frequency (${Checkpoint_Freq}): $dir"
                     cd "$dir"
+                    
+                    # alway update the run scripts in case config vars have changed
+                    # Create run script from template
+                    dir_basename="${dir##*/}"
+                    run_template="${InversionPath}/src/geoschem_run_scripts/gchp_ch4_run.template"
+                    sed -e "s:namename:${dir_basename}:g" ${run_template} >${dir_basename}.run
+                    chmod 755 ${dir_basename}.run
+                    
+                    echo "set run duration and checkpoint frequency (${Checkpoint_Freq}): $dir"
+                    
                     # set run duration and checkpoint frequency
                     sed -i -e "s/Run_Duration=\"[0-9]\{8\} 000000\"/Run_Duration=\"${RunDuration_chk}\"/" \
                         -e "s/^Midrun_Checkpoint=.*/Midrun_Checkpoint=ON/" \

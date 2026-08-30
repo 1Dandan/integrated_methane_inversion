@@ -401,6 +401,20 @@ while kill -0 "$srun_pid" 2>/dev/null; do
         {
             echo
             echo "Completed checkpoint detected."
+            echo "Waiting 60 seconds before cancelling GCHP step: $gchp_step_id"
+        } >> "$log"
+
+        sleep 60
+
+        # GCHP may have exited naturally during the 60-second wait.
+        if ! kill -0 "$srun_pid" 2>/dev/null; then
+            echo "GCHP step exited naturally during the 60-second wait." \
+                >> "$log"
+            break
+        fi
+
+        {
+            echo "60-second wait complete."
             echo "Cancelling GCHP step: $gchp_step_id"
         } >> "$log"
 
