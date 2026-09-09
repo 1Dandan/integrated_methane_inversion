@@ -704,8 +704,20 @@ def estimate_averaging_kernel(
         ylim = [-90, 90]
     else:
         # Latitude/longitude bounds of the inversion domain
-        xlim = [float(state_vector.lon.min()), float(state_vector.lon.max())]
-        ylim = [float(state_vector.lat.min()), float(state_vector.lat.max())]
+        sv_indomain = state_vector_labels.where(mask).stack(point=("lat", "lon")).dropna("point")
+        xlim = [float(sv_indomain.lon.min()), float(sv_indomain.lon.max())]
+        ylim = [float(sv_indomain.lat.min()), float(sv_indomain.lat.max())]
+        
+        if config["Res"] == "4.0x5.0":
+            deg_lat, deg_lon = 4.0, 5.0
+        elif config["Res"] == "2.0x2.5":
+            deg_lat, deg_lon = 2.0, 2.5
+        elif config["Res"] == "0.5x0.625":
+            deg_lat, deg_lon = 0.5, 0.625
+        elif config["Res"] == "0.25x0.3125":
+            deg_lat, deg_lon = 0.25, 0.3125
+        xlim = [xlim[0] - deg_lon/2, xlim[1] + deg_lon/2]
+        ylim = [ylim[0] - deg_lat/2, ylim[1] + deg_lat/2]
 
     start = f"{startday[0:4]}-{startday[4:6]}-{startday[6:8]} 00:00:00"
     end = f"{endday[0:4]}-{endday[4:6]}-{endday[6:8]} 23:59:59"
@@ -824,13 +836,10 @@ def estimate_averaging_kernel(
     )
     daily_observation_counts["obs_count"] = daily_observation_counts["obs_count"].fillna(0)
 
-    flux_per_sv, L, num_sv_elements, num_obs, m_superi = compute_sv_element_stats(
+    flux_per_sv, L, num_sv_elements = compute_sv_element_stats(
         state_vector_labels=state_vector_labels.values,
         areas=areas.values,
         prior=prior.values,
-        daily_observation_counts=daily_observation_counts,
-        config=config,
-        mask=mask.values,
         last_ROI_element=last_ROI_element,
         sum_and_sort_along_statevector=sum_and_sort_along_statevector,
     )
@@ -863,8 +872,6 @@ in the region of interest"
                 (endday_dt - startday_dt).days / config["UpdateFreqDays"]
             )
         # average number of successful observation days in each inversion period
-        m_superi = m_superi / n_periods
-        n_obs_per_period = np.round(num_obs / n_periods)
         outstring2 = f"Found {int(np.round(tot_num_obs / n_periods))} observations \
 ({int(np.round(tot_num_superobs / n_periods))} super observations) \
 in the region of interest per inversion period, for {int(n_periods)} period(s)"
@@ -887,30 +894,19 @@ in the region of interest per inversion period, for {int(n_periods)} period(s)"
     # Calculate superobservation error to use in averaging kernel sensitivity equation
     # from P observations per grid cell = number of observations per grid cell / number of super-observations
     # P is number of observations per grid cell (native state vector element)
-    P = np.array(num_obs) / m_superi
-    P = np.nan_to_num(P)  # replace nan with 0
-    s_superO_1 = calculate_superobservation_error(
-        sO, 1
-    )  # for handling cells with 0 observations (avoid divide by 0)
-
-    # list containing superobservation error per state vector element
-    s_superO_p = [
-        calculate_superobservation_error(sO, element) if element >= 1.0 else s_superO_1
-        for element in P
-    ]
-    s_superO = np.array(s_superO_p) * 1e-9  # convert to mol/mol
-
-    # TODO: add eqn number from Estrada et al. 2024 once published
+    P = tot_num_obs / tot_num_superobs  # average number of observations per superobservation
+    avg_s_superO = calculate_superobservation_error(sO, P) * 1e-9  # convert to mol/mol
+    
+    # Following eqn #4 from Estrada et al. 2025 instead of eqn #6
+    #    when using eqn #6, the number of observations would be too localized with 2 concentric rings,
+    #    which gives a very high (order of magnitude higher) DOFS with state vector clustering
+    #    eqn #4: a_ii = sA^2 / (sA^2 + (s_superO / k)^2 / (m_superi_tot / n_sv_tot))
     # Averaging kernel sensitivity for each grid element
     # Note: m_superi is the number of superobservations,
     # defined as sum of days in each grid cell with >0 successful obs
     # in the state vector element
-    # a is set to 0 where m_superi is 0
     k = alpha * (Mair * L * g / (Mch4 * U * p))
-    a = sA**2 / (sA**2 + (s_superO / k) ** 2 / (m_superi))
-    
-    # Places with 0 superobs should be 0
-    a = np.where(np.equal(m_superi, 0), float(0), a)
+    a = sA**2 / (sA**2 + (avg_s_superO / k) ** 2 / (tot_num_superobs / last_ROI_element))
 
     outstring3 = f"k = {np.round(k,5)} kg-1 m2 s"
     outstring4 = f"a = {np.round(a,5)} \n"
@@ -939,9 +935,6 @@ def compute_sv_element_stats(
     state_vector_labels,
     areas,
     prior,
-    daily_observation_counts,
-    config,
-    mask,
     last_ROI_element,
     sum_and_sort_along_statevector,
 ):
@@ -950,8 +943,6 @@ def compute_sv_element_stats(
       - emissions (sum(prior * area), kg/s)
       - L_native (sqrt(mean cell area), in same units as sqrt(areas))
       - num_native_elements (cell counts)
-      - num_obs (sum of obs_count over dilated masks)
-      - n_success_days (sum of superobs_count over dilated masks)
 
     Parameters
     ----------
@@ -962,15 +953,6 @@ def compute_sv_element_stats(
         Grid-cell areas (same shape as state_vector_labels), in m2 or whatever unit.
     prior : xarray.DataArray or ndarray
         Prior flux field in same grid and units so prior*areas is kg/s (or equivalent).
-    daily_observation_counts : xarray.Dataset
-        Must contain:
-          - "obs_count" and "superobs_count"
-          - For GCHP: dims (date, nf, Y, X) and vars "lats", "lons"
-          - For non-GCHP: dims (lat, lon, date) and coords "lat", "lon"
-    config : dict
-        Must contain key "UseGCHP" (bool).
-    mask : ndarray or xarray.DataArray (bool)
-        ROI mask: True where state_vector_labels <= last_ROI_element.
     last_ROI_element : int
         Largest label index in ROI (no buffers).
     sum_and_sort_along_statevector : callable
@@ -980,31 +962,19 @@ def compute_sv_element_stats(
     emissions : np.ndarray, shape (last_ROI_element,)
     L_native : np.ndarray, shape (last_ROI_element,)
     num_native_elements : np.ndarray, shape (last_ROI_element,), int
-    num_obs : np.ndarray, shape (last_ROI_element,)
-    n_success_days : np.ndarray, shape (last_ROI_element,)
     """
 
     # ------------------------------------------------------------------
-    # 0. Flatten state-vector labels (background = NaN)
+    # Flatten state-vector labels (background = NaN)
     # ------------------------------------------------------------------
     sv = np.asarray(state_vector_labels)
-    sv_labels_flat = sv.ravel()
-    Ncells = sv_labels_flat.size
-
-    # Sanity check: ROI labels must be exactly 1..last_ROI_element
-    unique_labels = np.unique(sv[mask])
-    unique_labels = unique_labels[~np.isnan(unique_labels)]
-    unique_labels = unique_labels.astype(int)
-    assert unique_labels[0] == 1
-    assert unique_labels[-1] == last_ROI_element
-    assert unique_labels.size == last_ROI_element
 
     # ------------------------------------------------------------------
-    # 1. Per–state-vector-element static quantities
+    # Per–state-vector-element static quantities
     # ------------------------------------------------------------------
     areas_arr = np.asarray(areas)
     prior_arr = np.asarray(prior)
-
+    
     # (a) total area per SV element (ROI + buffers, then slice ROI)
     area_per_sv_all = sum_and_sort_along_statevector(
         val=areas_arr,
@@ -1019,7 +989,6 @@ def compute_sv_element_stats(
         sv=sv,
     )
     cell_count_per_sv = cell_count_per_sv_all[:last_ROI_element]
-    num_native_elements = cell_count_per_sv
 
     # (c) native length scale L_native = sqrt(mean cell area)
     mean_area_per_sv = area_per_sv / np.maximum(cell_count_per_sv, 1.0)
@@ -1033,168 +1002,13 @@ def compute_sv_element_stats(
     flux_per_sv = (emissions_per_sv_all / area_per_sv_all)[:last_ROI_element]
 
     # ------------------------------------------------------------------
-    # 2. Collapse obs + superobs over time for each grid cell
-    # ------------------------------------------------------------------
-    use_gchp = config['UseGCHP']
-    obs_da = daily_observation_counts["obs_count"]
-    superobs_da = daily_observation_counts["superobs_count"]
-
-    if use_gchp:
-        # obs dims: (date, nf, Y, X)
-        obs = obs_da.values
-        superobs = superobs_da.values
-        T, nf, Ny, Nx = obs.shape
-        assert Ncells == nf * Ny * Nx
-
-        obs_flat = obs.reshape(T, Ncells)
-        superobs_flat = superobs.reshape(T, Ncells)
-
-        obs_per_cell = np.nansum(obs_flat, axis=0)
-        super_per_cell = np.nansum(superobs_flat, axis=0)
-
-        # KDTree coordinates must match flatten order
-        CSlats = daily_observation_counts["lats"].values  # (nf, Y, X)
-        CSlons = daily_observation_counts["lons"].values
-        kdtree, grid_shape = build_kdtree(CSlats, CSlons)
-        assert grid_shape == sv.shape
-
-        lat_flat = CSlats.ravel()
-        lon_flat = CSlons.ravel()
-
-    else:
-        # obs dims: (date, lat, lon)
-        obs = obs_da.values
-        superobs = superobs_da.values
-
-        T, Ny, Nx = obs.shape
-        assert Ncells == Ny * Nx
-
-        obs_flat = obs.reshape(T, Ncells)
-        superobs_flat = superobs.reshape(T, Ncells)
-
-        obs_per_cell = np.nansum(obs_flat, axis=0)
-        super_per_cell = np.nansum(superobs_flat, axis=0)
-
-        lats_1d = daily_observation_counts["lat"].values
-        lons_1d = daily_observation_counts["lon"].values
-        kdtree, grid_shape = build_kdtree(lats_1d, lons_1d)
-        assert grid_shape == sv.shape
-
-        lat_grid, lon_grid = np.meshgrid(lats_1d, lons_1d, indexing="ij")
-        lat_flat = lat_grid.ravel()
-        lon_flat = lon_grid.ravel()
-
-    assert sv_labels_flat.shape[0] == Ncells
-    assert obs_per_cell.shape[0] == Ncells
-
-    # ------------------------------------------------------------------
-    # 3. KDTree query for ROI-labeled cells only
-    # ------------------------------------------------------------------
-    # mask: state_vector_labels <= last_ROI_element
-    sv_mask_flat = np.asarray(mask).ravel()
-    sv_indices_flat = np.where(sv_mask_flat)[0]     # (M,) indices of ROI cells
-    sv_labels_nonsorted = sv_labels_flat[sv_indices_flat].astype(int)  # (M,)
-
-    # Safety: ensure only ROI labels appear
-    assert sv_labels_nonsorted.min() >= 1
-    assert sv_labels_nonsorted.max() <= last_ROI_element
-
-    # Coordinates for ROI cells
-    query_cart = latlon_to_cartesian(
-        lat_flat[sv_indices_flat],
-        lon_flat[sv_indices_flat],
-    )
-
-    # KDTree neighbor search
-    # Following eqn. 11 of Nesser et al., 2021 we increase the mask
-    # size by adding concentric rings to mimic transport/diffusion
-    # when counting observations. We use 2 concentric rings based on
-    # empirical evidence -- Nesser et al used 3.
-    n_neighbors = 49
-    _, neighbor_idxs = kdtree.query(query_cart, k=n_neighbors)
-    
-    neighbor_idxs = np.atleast_2d(neighbor_idxs)
-    if neighbor_idxs.shape[0] == 1 and query_cart.shape[0] > 1:
-        neighbor_idxs = neighbor_idxs.T
-
-    M, K = neighbor_idxs.shape # M = #ROI cells, K = n_neighbors
-
-    # ------------------------------------------------------------------
-    # 4. UNION semantics: deduplicate (label, neighbor_cell) pairs
-    # ------------------------------------------------------------------
-    # For each ROI cell, repeat its label K times to align with neighbors
-    labels_rep = np.repeat(sv_labels_nonsorted, K)    # (M*K,)
-    cells_neighbors = neighbor_idxs.ravel()           # (M*K,)
-
-    # Encode (label, cell) uniquely as: code = label * Ncells + cell
-    labels_64 = labels_rep.astype(np.int64, copy=False)
-    cells_64 = cells_neighbors.astype(np.int64, copy=False)
-    pair_codes = labels_64 * np.int64(Ncells) + cells_64
-
-    # Optimization: if each label appears only once among ROI cells,
-    # duplicates are mathematically impossible, so skip np.unique.
-    label_counts = np.bincount(
-        sv_labels_nonsorted.astype(int),
-        minlength=last_ROI_element + 1,
-    )
-    if label_counts[1:].max() == 1:
-        pair_codes_unique = pair_codes
-    else:
-        pair_codes_unique = np.unique(pair_codes)
-
-    # Decode back into (label, cell)
-    labels_unique = (pair_codes_unique // Ncells).astype(int)
-    cells_unique = (pair_codes_unique % Ncells).astype(int)
-
-    # Convert 1-based labels to 0-based SV indices
-    sv_indices = labels_unique - 1
-
-    # ------------------------------------------------------------------
-    # 5. Aggregate obs & superobs per SV element
-    # ------------------------------------------------------------------
-    num_obs_buffer = np.bincount(
-        sv_indices,
-        weights=obs_per_cell[cells_unique],
-        minlength=last_ROI_element,
-    )
-    n_success_days_buffer = np.bincount(
-        sv_indices,
-        weights=super_per_cell[cells_unique],
-        minlength=last_ROI_element,
-    )
-
-    # --------------------------------------------------------------------
-    # 5b. Count neighbor-state-vectors in buffer zone that are in ROI mask
-    # --------------------------------------------------------------------
-    # For each (label, neighbor_cell) pair in the union set, 
-    # # count 1 if that neighbor_cell is inside ROI state vector mask 
-    num_native_elements_buffer = np.bincount( 
-        sv_indices, 
-        weights=sv_mask_flat[cells_unique].astype(np.int64), 
-        minlength=last_ROI_element, 
-    ).astype(np.int64)
-    
-    num_unique_labels = np.zeros(last_ROI_element, dtype=int)
-
-    for sv_label in range(1, last_ROI_element + 1):
-        # cells in the union buffer for this SV
-        buf_cells = cells_unique[labels_unique == sv_label]
-
-        neighbor_labels = sv_labels_flat[buf_cells]
-        neighbor_labels = neighbor_labels[~np.isnan(neighbor_labels)]
-
-        num_unique_labels[sv_label - 1] = np.unique(neighbor_labels).size
-
-    # ------------------------------------------------------------------
-    # 6. Return NumPy arrays aligned by SV index (0→label1, ..., N-1→labelN)
+    # Return NumPy arrays aligned by SV index (0→label1, ..., N-1→labelN)
     # ------------------------------------------------------------------
     emissions = flux_per_sv                                    # (Nsv,)
     L_native = L_native_per_sv                                 # (Nsv,)
-    num_sv_elements = num_unique_labels                        # (Nsv,)
-    num_obs = num_obs_buffer / num_sv_elements                 # (Nsv,)
-    n_success_days = n_success_days_buffer / num_sv_elements   # (Nsv,)
+    num_sv_elements = cell_count_per_sv                        # (Nsv,)
 
-    return emissions, L_native, num_sv_elements, num_obs, n_success_days
+    return emissions, L_native, num_sv_elements
 
 if __name__ == "__main__":
     try:
