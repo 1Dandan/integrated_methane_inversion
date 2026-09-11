@@ -39,7 +39,6 @@ from src.inversion_scripts.classify_TROPOMI_obs_to_CSgrids import (
     latlon_to_cartesian,
     build_kdtree,
     classify_obs_to_cs_grid,
-    map_obs_to_CSgrid,
 )
 
 from src.inversion_scripts.regrid_precomputed_jacobian import(
@@ -47,6 +46,153 @@ from src.inversion_scripts.regrid_precomputed_jacobian import(
 )
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
+
+
+def get_sensitivity_cache_path(
+    preview_dir,
+    filename="sensitivities.nc",
+    kf_index=None,
+):
+    """
+    Return the path for a cached 1-D sensitivity array.
+
+    If kf_index is supplied, append ``_period{kf_index}`` before the
+    filename extension, e.g. ``native_sensitivities_period3.nc``.
+    """
+    if kf_index is not None:
+        stem, ext = os.path.splitext(filename)
+        filename = f"{stem}_period{int(kf_index)}{ext}"
+
+    return os.path.join(preview_dir, filename)
+
+
+def save_sensitivities(
+    sensitivities,
+    preview_dir,
+    filename="sensitivities.nc",
+    kf_index=None,
+    config=None,
+    state_vector_path=None,
+):
+    """
+    Save a 1-D averaging-kernel sensitivity vector.
+
+    The caller determines whether the values are native or clustered by
+    choosing the filename. For example:
+
+      - ``sensitivities.nc`` for the current clustered StateVector.nc
+      - ``native_sensitivities.nc`` for NativeStateVector.nc
+
+    Kalman-filter periods are handled automatically through kf_index.
+    """
+    sensitivities = np.asarray(sensitivities, dtype=np.float64)
+
+    if sensitivities.ndim != 1:
+        raise ValueError(
+            f"Sensitivities must be 1-D, got shape {sensitivities.shape}"
+        )
+
+    output_path = get_sensitivity_cache_path(
+        preview_dir,
+        filename=filename,
+        kf_index=kf_index,
+    )
+
+    ds = xr.Dataset(
+        data_vars={
+            "Sensitivity": (
+                ["state_vector_element"],
+                sensitivities,
+                {
+                    "long_name": "Estimated averaging-kernel sensitivity",
+                    "units": "1",
+                },
+            )
+        },
+        coords={
+            "state_vector_element": np.arange(
+                1, sensitivities.size + 1, dtype=np.int32
+            )
+        },
+    )
+
+    if config is not None:
+        if "StartDate" in config:
+            ds.attrs["StartDate"] = str(config["StartDate"])
+        if "EndDate" in config:
+            ds.attrs["EndDate"] = str(config["EndDate"])
+        if "nBufferClusters" in config:
+            ds.attrs["nBufferClusters"] = int(config["nBufferClusters"])
+
+    if state_vector_path is not None:
+        ds.attrs["StateVectorFile"] = os.path.abspath(state_vector_path)
+
+    if kf_index is not None:
+        ds.attrs["kf_index"] = int(kf_index)
+
+    os.makedirs(preview_dir, exist_ok=True)
+
+    # Atomic replacement prevents an interrupted run from leaving a partial cache.
+    tmp_path = output_path + ".tmp"
+    ds.to_netcdf(
+        tmp_path,
+        encoding={"Sensitivity": {"zlib": True, "complevel": 1}},
+    )
+    os.replace(tmp_path, output_path)
+    ds.close()
+
+    print(f"Saved {sensitivities.size} sensitivities to {output_path}")
+    return output_path
+
+
+def load_sensitivities(
+    preview_dir,
+    filename="sensitivities.nc",
+    expected_size=None,
+    kf_index=None,
+):
+    """
+    Load a cached 1-D averaging-kernel sensitivity vector.
+
+    Returns None when no matching cache exists. If expected_size is supplied,
+    the cache must contain exactly that many state-vector elements.
+    """
+    cache_path = get_sensitivity_cache_path(
+        preview_dir,
+        filename=filename,
+        kf_index=kf_index,
+    )
+
+    if not os.path.exists(cache_path):
+        return None
+
+    with xr.open_dataset(cache_path) as ds:
+        sensitivities = ds["Sensitivity"].values.copy()
+        cached_kf_index = ds.attrs.get("kf_index", None)
+
+    if sensitivities.ndim != 1:
+        raise ValueError(
+            f"Cached sensitivities must be 1-D, got shape "
+            f"{sensitivities.shape}: {cache_path}"
+        )
+
+    if expected_size is not None and sensitivities.size != int(expected_size):
+        raise ValueError(
+            f"Cached sensitivity size ({sensitivities.size}) does not match "
+            f"the expected state-vector size ({int(expected_size)}): "
+            f"{cache_path}"
+        )
+
+    if kf_index is not None and cached_kf_index is not None:
+        if int(cached_kf_index) != int(kf_index):
+            raise ValueError(
+                f"Cached kf_index ({cached_kf_index}) does not match "
+                f"requested kf_index ({kf_index}): {cache_path}"
+            )
+
+    print(f"Loaded {sensitivities.size} sensitivities from {cache_path}")
+    return sensitivities
+
 
 def get_TROPOMI_data(
     file_path, BlendedTROPOMI, xlim, ylim, startdate_np64, enddate_np64, use_water_obs
@@ -74,9 +220,6 @@ def get_TROPOMI_data(
          tropomi_data: dict
             dictionary of the extracted values
     """
-    # tropomi data dictionary
-    tropomi_data = {"lat": [], "lon": [], "xch4": [], "swir_albedo": [], "time": []}
-
     # Load the TROPOMI data
     assert isinstance(BlendedTROPOMI, bool), "BlendedTROPOMI is not a bool"
     if BlendedTROPOMI:
@@ -98,22 +241,19 @@ def get_TROPOMI_data(
             TROPOMI, xlim, ylim, startdate_np64, enddate_np64, use_water_obs
         )
 
-    # Loop over observations and archive
-    num_obs = len(sat_ind[0])
-    for k in range(num_obs):
-        lat_idx = sat_ind[0][k]
-        lon_idx = sat_ind[1][k]
-        tropomi_data["lat"].append(TROPOMI["latitude"][lat_idx, lon_idx])
-        tropomi_data["lon"].append(TROPOMI["longitude"][lat_idx, lon_idx])
-        tropomi_data["xch4"].append(TROPOMI["methane"][lat_idx, lon_idx])
-        tropomi_data["swir_albedo"].append(TROPOMI["swir_albedo"][lat_idx, lon_idx])
-        tropomi_data["time"].append(TROPOMI["time"][lat_idx, lon_idx])
-
-    return tropomi_data
+    # Extract all valid observations at once using NumPy advanced indexing.
+    # This avoids a Python loop over every individual TROPOMI pixel.
+    return {
+        "lat": np.asarray(TROPOMI["latitude"][sat_ind]),
+        "lon": np.asarray(TROPOMI["longitude"][sat_ind]),
+        "xch4": np.asarray(TROPOMI["methane"][sat_ind]),
+        "swir_albedo": np.asarray(TROPOMI["swir_albedo"][sat_ind]),
+        "time": np.asarray(TROPOMI["time"][sat_ind]),
+    }
 
 
 def imi_preview(
-    config_path, state_vector_path, preview_dir, tropomi_cache
+    config_path, state_vector_path, preview_dir, tropomi_cache, kf_index=None
 ):
     """
     Function to perform preview
@@ -191,8 +331,20 @@ def imi_preview(
         preview_dir,
         tropomi_cache,
         preview=True,
-        kf_index=None,
+        kf_index=kf_index,
     )
+
+    # Cache sensitivities for the current (possibly clustered) StateVector.
+    # Native sensitivities are cached separately by aggregation.py.
+    save_sensitivities(
+        a,
+        preview_dir,
+        filename="sensitivities.nc",
+        kf_index=kf_index,
+        config=config,
+        state_vector_path=state_vector_path,
+    )
+
     mask = state_vector_labels <= last_ROI_element
 
     # ----------------------------------
@@ -741,14 +893,8 @@ def estimate_averaging_kernel(
     # Use blended TROPOMI+GOSAT data or operational TROPOMI data?
     BlendedTROPOMI = config["BlendedTROPOMI"]
 
-    # Open tropomi files and filter data
-    lat = []
-    lon = []
-    xch4 = []
-    albedo = []
-    trtime = []
-
-    # Read in and filter tropomi observations (uses parallel processing)
+    # Read in and filter tropomi observations (uses parallel processing).
+    # Keep n_jobs=-1 so joblib uses the CPUs available to this Slurm job.
     observation_dicts = Parallel(n_jobs=-1)(
         delayed(get_TROPOMI_data)(
             file_path,
@@ -761,30 +907,88 @@ def estimate_averaging_kernel(
         )
         for file_path in tropomi_paths
     )
-    # Remove any problematic observation dicts (eg. corrupted data file)
+    # Remove any problematic observation dicts (eg. corrupted data file).
     observation_dicts = list(filter(None, observation_dicts))
 
-    for obs_dict in observation_dicts:
-        lat.extend(obs_dict["lat"])
-        lon.extend(obs_dict["lon"])
-        xch4.extend(obs_dict["xch4"])
-        albedo.extend(obs_dict["swir_albedo"])
-        trtime.extend(obs_dict["time"])
+    if observation_dicts:
+        lat = np.concatenate([obs_dict["lat"] for obs_dict in observation_dicts])
+        lon = np.concatenate([obs_dict["lon"] for obs_dict in observation_dicts])
+        xch4 = np.concatenate([obs_dict["xch4"] for obs_dict in observation_dicts])
+        albedo = np.concatenate(
+            [obs_dict["swir_albedo"] for obs_dict in observation_dicts]
+        )
+        trtime = np.concatenate([obs_dict["time"] for obs_dict in observation_dicts])
+    else:
+        lat = np.array([], dtype=float)
+        lon = np.array([], dtype=float)
+        xch4 = np.array([], dtype=float)
+        albedo = np.array([], dtype=float)
+        trtime = np.array([], dtype="datetime64[ns]")
 
-    # Assemble in dataframe
-    df = pd.DataFrame()
-    df["lat"] = lat
-    df["lon"] = lon
-    df["obs_count"] = np.ones(len(lat))
-    df["swir_albedo"] = albedo
-    df["xch4"] = xch4
-    df["time"] = trtime
+    # Assemble in dataframe.
+    df = pd.DataFrame(
+        {
+            "lat": lat,
+            "lon": lon,
+            "obs_count": np.ones(len(lat), dtype=np.uint8),
+            "swir_albedo": albedo,
+            "xch4": xch4,
+            "time": pd.to_datetime(trtime),
+        }
+    )
 
-    # Set resolution specific variables
-    # L_native = Rough length scale of native state vector element [m]
+    # Set resolution-specific observation-count variables.
+    # num_obs[i] and num_superobs[i] correspond to StateVector label i+1.
     if config['UseGCHP']:
-        df_super = classify_obs_to_cs_grid(df, gridfpath)
-        daily_observation_counts = map_obs_to_CSgrid(df_super, gridfpath)
+        # Classify observations directly to cubed-sphere native grid cells.
+        # No dense (date, nf, Ydim, Xdim) array is constructed.
+        kdtree_workers = int(os.environ.get("SLURM_CPUS_PER_TASK", "1"))
+        print(
+            f"Classifying {len(df)} observations to the cubed-sphere grid "
+            f"with {kdtree_workers} KDTree worker(s)"
+        )
+        df_super = classify_obs_to_cs_grid(
+            df,
+            gridfpath,
+            workers=kdtree_workers,
+        )
+
+        # build_kdtree() flattens the GCHP grid in C order, so sim_index maps
+        # directly to the same flattened (nf, Ydim, Xdim) StateVector grid.
+        sv_flat = np.asarray(state_vector_labels.values).reshape(-1)
+        sim_index = df_super["sim_index"].to_numpy(dtype=np.int64)
+        obs_sv_labels = sv_flat[sim_index]
+
+        # Keep observations assigned to ROI state-vector elements only.
+        valid_obs = (
+            np.isfinite(obs_sv_labels)
+            & (obs_sv_labels >= 1)
+            & (obs_sv_labels <= last_ROI_element)
+        )
+
+        sv_idx = obs_sv_labels[valid_obs].astype(np.int64) - 1
+
+        # Raw observation count per ROI state-vector element. Each row in df
+        # currently represents one successful observation (obs_count == 1).
+        num_obs = np.bincount(
+            sv_idx,
+            minlength=last_ROI_element,
+        ).astype(np.int64)
+
+        # One superobservation is one occupied native simulation grid cell on
+        # one day. Deduplicate (date, sim_index), NOT (date, StateVector label),
+        # because one SV element can contain many native grid cells.
+        valid_pairs = df_super.loc[
+            valid_obs,
+            ["date", "sim_index"],
+        ]
+        first_in_superob = ~valid_pairs.duplicated().to_numpy()
+
+        num_superobs = np.bincount(
+            sv_idx[first_in_superob],
+            minlength=last_ROI_element,
+        ).astype(np.int64)
+
     else:
         # Set resolution specific variables
         # L_native = Rough length scale of native state vector element [m]
@@ -804,7 +1008,7 @@ def estimate_averaging_kernel(
             lat_step = 4.0
             lon_step = 5.0
 
-        # bin observations into gridcells and map onto statevector
+        # Bin observations into native grid cells.
         to_lon = lambda x: np.floor(x / lon_step) * lon_step
         to_lat = lambda x: np.floor(x / lat_step) * lat_step
 
@@ -813,39 +1017,67 @@ def estimate_averaging_kernel(
         df_super["lat"] = to_lat(df_super.old_lat)
         df_super["lon"] = to_lon(df_super.old_lon)
 
-        # extract relevant fields and group by lat, lon, date
+        # Extract relevant fields and group by lat, lon, date.
         df_super = df_super[["lat", "lon", "time", "obs_count"]].copy()
         df_super["date"] = df_super["time"].dt.floor("D")
         grouped = (
-            df_super.groupby(["lat", "lon", "date"]).size().reset_index(name="obs_count")
+            df_super.groupby(["lat", "lon", "date"])
+            .size()
+            .reset_index(name="obs_count")
         )
 
-        # convert the grouped DataFrame to an xarray Dataset
-        daily_observation_counts = grouped.set_index(["lat", "lon", "date"]).to_xarray()
+        # Convert the grouped DataFrame to a daily native-grid Dataset.
+        daily_observation_counts = grouped.set_index(
+            ["lat", "lon", "date"]
+        ).to_xarray()
         daily_observation_counts = daily_observation_counts.reindex(
             lat=state_vector["lat"],
             lon=state_vector["lon"],
         ).transpose("date", "lat", "lon")
 
-    # create a daily superobservation count as well
-    daily_observation_counts["superobs_count"] = daily_observation_counts["obs_count"]
+        daily_observation_counts["superobs_count"] = (
+            daily_observation_counts["obs_count"]
+        )
+        daily_observation_counts["superobs_count"].values = np.where(
+            np.isnan(np.asarray(daily_observation_counts["obs_count"].values)),
+            0,
+            1,
+        )
+        daily_observation_counts["obs_count"] = (
+            daily_observation_counts["obs_count"].fillna(0)
+        )
 
-    # set the nans to 0 if there are no observations. For superobs each day is 1 superob
-    daily_observation_counts["superobs_count"].values = np.where(
-        np.isnan(np.array(daily_observation_counts["obs_count"].values)), 0, 1
-    )
-    daily_observation_counts["obs_count"] = daily_observation_counts["obs_count"].fillna(0)
+        # Collapse the date dimension first, then aggregate native-grid counts
+        # by StateVector label.
+        obs_count_grid = daily_observation_counts["obs_count"].sum(
+            dim="date"
+        ).values
+        superobs_count_grid = daily_observation_counts["superobs_count"].sum(
+            dim="date"
+        ).values
+
+        num_obs = sum_and_sort_along_statevector(
+            val=obs_count_grid,
+            sv=state_vector_labels.values,
+        )[:last_ROI_element].astype(np.int64)
+
+        num_superobs = sum_and_sort_along_statevector(
+            val=superobs_count_grid,
+            sv=state_vector_labels.values,
+        )[:last_ROI_element].astype(np.int64)
+
+    # Domain totals are retained for diagnostics and for the original AK
+    # approximation below.
+    tot_num_obs = int(num_obs.sum())
+    tot_num_superobs = int(num_superobs.sum())
 
     flux_per_sv, L, num_sv_elements = compute_sv_element_stats(
-        state_vector_labels=state_vector_labels.values,
-        areas=areas.values,
-        prior=prior.values,
+        state_vector_labels=state_vector_labels,
+        areas=areas,
+        prior=prior,
         last_ROI_element=last_ROI_element,
         sum_and_sort_along_statevector=sum_and_sort_along_statevector,
     )
-
-    tot_num_obs = np.sum(daily_observation_counts["obs_count"].values)
-    tot_num_superobs = np.sum(daily_observation_counts["superobs_count"].values)
     if tot_num_obs < 1:
         sys.exit("Error: No observations found in region of interest")
     outstring2 = f"Found {tot_num_obs} observations ({tot_num_superobs} super observations) \
@@ -891,22 +1123,40 @@ in the region of interest per inversion period, for {int(n_periods)} period(s)"
     sA = sigmaA * flux_per_sv
     sO = config["ObsError"][0] if isinstance(config["ObsError"], list) else config["ObsError"]
 
-    # Calculate superobservation error to use in averaging kernel sensitivity equation
-    # from P observations per grid cell = number of observations per grid cell / number of super-observations
-    # P is number of observations per grid cell (native state vector element)
-    P = tot_num_obs / tot_num_superobs  # average number of observations per superobservation
-    avg_s_superO = calculate_superobservation_error(sO, P) * 1e-9  # convert to mol/mol
-    
-    # Following eqn #4 from Estrada et al. 2025 instead of eqn #6
-    #    when using eqn #6, the number of observations would be too localized with 2 concentric rings,
-    #    which gives a very high (order of magnitude higher) DOFS with state vector clustering
-    #    eqn #4: a_ii = sA^2 / (sA^2 + (s_superO / k)^2 / (m_superi_tot / n_sv_tot))
-    # Averaging kernel sensitivity for each grid element
-    # Note: m_superi is the number of superobservations,
-    # defined as sum of days in each grid cell with >0 successful obs
-    # in the state vector element
+    # Calculate superobservation error per state-vector element using the
+    # original IMI logic. P is the average number of raw observations
+    # contributing to one native-grid superobservation within each SV element.
+    num_obs = np.asarray(num_obs, dtype=float)
+    num_superobs = np.asarray(num_superobs, dtype=float)
+
+    P = np.divide(
+        num_obs,
+        num_superobs,
+        out=np.zeros_like(num_obs),
+        where=num_superobs > 0,
+    )
+
+    # Original behavior for cells with no observations (or any P < 1): use
+    # the superobservation error corresponding to P=1, then explicitly set
+    # their AK sensitivity to zero below.
+    P_safe = np.where(P >= 1.0, P, 1.0)
+    s_superO = calculate_superobservation_error(sO, P_safe) * 1e-9
+
+    # Following eqn #6 from Estrada et al. 2025, but without accounting for
+    # observations in the two concentric rings around each native grid cell.
+    # num_superobs is therefore the number of superobservations associated
+    # directly with each state-vector element.
     k = alpha * (Mair * L * g / (Mch4 * U * p))
-    a = sA**2 / (sA**2 + (avg_s_superO / k) ** 2 / (tot_num_superobs / last_ROI_element))
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        a = sA**2 / (
+            sA**2
+            + (s_superO / k) ** 2
+            / num_superobs
+        )
+
+    # Places with zero superobservations should have zero sensitivity.
+    a = np.where(num_superobs == 0, 0.0, a)
 
     outstring3 = f"k = {np.round(k,5)} kg-1 m2 s"
     outstring4 = f"a = {np.round(a,5)} \n"
@@ -939,42 +1189,107 @@ def compute_sv_element_stats(
     sum_and_sort_along_statevector,
 ):
     """
-    Compute per–state-vector-element quantities:
-      - emissions (sum(prior * area), kg/s)
-      - L_native (sqrt(mean cell area), in same units as sqrt(areas))
-      - num_native_elements (cell counts)
+    Compute per-state-vector-element quantities:
+      - mean prior flux within each state-vector element
+      - L_native = sqrt(mean native grid-cell area)
+      - number of native grid cells in each state-vector element
+
+    For xarray inputs, `areas` and `prior` are explicitly aligned to the
+    state-vector spatial dimensions before conversion to NumPy. This handles
+    singleton non-spatial dimensions such as `time=1` in a cached
+    mean-emissions file and avoids boolean-index shape mismatches.
 
     Parameters
     ----------
     state_vector_labels : xarray.DataArray or ndarray
-        State vector label grid, with NaN for background, integers for elements.
-        Shape must match `areas` and the spatial dims of `daily_observation_counts`.
+        State vector label grid, with NaN for background and integer labels.
     areas : xarray.DataArray or ndarray
-        Grid-cell areas (same shape as state_vector_labels), in m2 or whatever unit.
+        Grid-cell areas, spatially matching the state vector after singleton
+        non-spatial dimensions are removed.
     prior : xarray.DataArray or ndarray
-        Prior flux field in same grid and units so prior*areas is kg/s (or equivalent).
+        Prior flux field, spatially matching the state vector after singleton
+        non-spatial dimensions are removed.
     last_ROI_element : int
         Largest label index in ROI (no buffers).
     sum_and_sort_along_statevector : callable
-        Function (val, sv, fill_value=np.nan) -> per-label sums, in ascending label order.
+        Function (val, sv, fill_value=np.nan) -> per-label sums, in ascending
+        label order.
+
     Returns
     -------
     emissions : np.ndarray, shape (last_ROI_element,)
+        Mean prior flux in each state-vector element.
     L_native : np.ndarray, shape (last_ROI_element,)
-    num_native_elements : np.ndarray, shape (last_ROI_element,), int
+        Characteristic native grid-cell length scale in each element.
+    num_native_elements : np.ndarray, shape (last_ROI_element,)
+        Number of native grid cells in each element.
     """
 
-    # ------------------------------------------------------------------
-    # Flatten state-vector labels (background = NaN)
-    # ------------------------------------------------------------------
-    sv = np.asarray(state_vector_labels)
+    def _align_to_state_vector(data, name, sv_dims, sv_shape):
+        """Return `data` as a NumPy array matching state-vector dimension order."""
+        if isinstance(data, xr.DataArray):
+            arr = data
 
-    # ------------------------------------------------------------------
-    # Per–state-vector-element static quantities
-    # ------------------------------------------------------------------
-    areas_arr = np.asarray(areas)
-    prior_arr = np.asarray(prior)
-    
+            # Remove only singleton dimensions that are not state-vector dims,
+            # e.g. time=1 in a cached mean-emissions file.
+            extra_dims = [dim for dim in arr.dims if dim not in sv_dims]
+            for dim in extra_dims:
+                if arr.sizes[dim] != 1:
+                    raise ValueError(
+                        f"{name} has unexpected non-spatial dimension "
+                        f"{dim}={arr.sizes[dim]}; state-vector dims are {sv_dims}."
+                    )
+                arr = arr.squeeze(dim=dim, drop=True)
+
+            missing_dims = [dim for dim in sv_dims if dim not in arr.dims]
+            if missing_dims:
+                raise ValueError(
+                    f"{name} is missing state-vector dimension(s) {missing_dims}; "
+                    f"{name} dims are {arr.dims}."
+                )
+
+            arr = arr.transpose(*sv_dims)
+            out = np.asarray(arr.values)
+        else:
+            # For ndarray input, singleton dimensions are the only dimensions
+            # we can safely remove because dimension names are unavailable.
+            out = np.squeeze(np.asarray(data))
+
+        if out.shape != sv_shape:
+            raise ValueError(
+                f"{name} shape {out.shape} does not match state-vector shape "
+                f"{sv_shape}."
+            )
+
+        return out
+
+    # Preserve xarray dimension names long enough to align GCHP fields.
+    if isinstance(state_vector_labels, xr.DataArray):
+        sv_dims = state_vector_labels.dims
+        sv = np.asarray(state_vector_labels.values)
+    else:
+        sv = np.squeeze(np.asarray(state_vector_labels))
+        sv_dims = None
+
+    sv_shape = sv.shape
+
+    if sv_dims is not None:
+        areas_arr = _align_to_state_vector(areas, "areas", sv_dims, sv_shape)
+        prior_arr = _align_to_state_vector(prior, "prior", sv_dims, sv_shape)
+    else:
+        areas_arr = np.squeeze(np.asarray(areas))
+        prior_arr = np.squeeze(np.asarray(prior))
+        if areas_arr.shape != sv_shape:
+            raise ValueError(
+                f"areas shape {areas_arr.shape} does not match state-vector "
+                f"shape {sv_shape}."
+            )
+        if prior_arr.shape != sv_shape:
+            raise ValueError(
+                f"prior shape {prior_arr.shape} does not match state-vector "
+                f"shape {sv_shape}."
+            )
+
     # (a) total area per SV element (ROI + buffers, then slice ROI)
     area_per_sv_all = sum_and_sort_along_statevector(
         val=areas_arr,
@@ -994,21 +1309,14 @@ def compute_sv_element_stats(
     mean_area_per_sv = area_per_sv / np.maximum(cell_count_per_sv, 1.0)
     L_native_per_sv = np.sqrt(mean_area_per_sv)
 
-    # (d) emission flux per SV element (kg/s)
+    # (d) mean prior flux per SV element
     emissions_per_sv_all = sum_and_sort_along_statevector(
         val=prior_arr * areas_arr,
         sv=sv,
     )
     flux_per_sv = (emissions_per_sv_all / area_per_sv_all)[:last_ROI_element]
 
-    # ------------------------------------------------------------------
-    # Return NumPy arrays aligned by SV index (0→label1, ..., N-1→labelN)
-    # ------------------------------------------------------------------
-    emissions = flux_per_sv                                    # (Nsv,)
-    L_native = L_native_per_sv                                 # (Nsv,)
-    num_sv_elements = cell_count_per_sv                        # (Nsv,)
-
-    return emissions, L_native, num_sv_elements
+    return flux_per_sv, L_native_per_sv, cell_count_per_sv
 
 if __name__ == "__main__":
     try:
@@ -1016,9 +1324,14 @@ if __name__ == "__main__":
         state_vector_path = sys.argv[2]
         preview_dir = sys.argv[3]
         tropomi_cache = sys.argv[4]
+        kf_index = int(sys.argv[5]) if len(sys.argv) > 5 else None
 
         imi_preview(
-            config_path, state_vector_path, preview_dir, tropomi_cache
+            config_path,
+            state_vector_path,
+            preview_dir,
+            tropomi_cache,
+            kf_index=kf_index,
         )
     except Exception as err:
         with open(os.path.join(preview_dir, ".preview_error_status.txt"), "w") as file1:

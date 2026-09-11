@@ -32,7 +32,8 @@ def build_kdtree(lats, lons):
 def classify_obs_to_cs_grid(
     obs_df: pd.DataFrame,
     grid_path: str,
-    k: int = 1
+    k: int = 1,
+    workers: int = 1,
 ) -> pd.DataFrame:
     """
     Classify observation points into a cubed-sphere grid.
@@ -41,7 +42,9 @@ def classify_obs_to_cs_grid(
     - obs_df: filtered TROPOMI observations as a pandas DataFrame
               with at least 'lat', 'lon', 'time', 'obs_count' columns
     - grid_path: Path to cubed-sphere grid NetCDF file
-    - k: Number of KDTree neighbors to consider for polygon check
+    - k: Number of KDTree neighbors to query
+    - workers: Number of worker threads used by scipy.spatial.cKDTree.query.
+               Use -1 for all available CPUs.
 
     Returns:
     - obs_super: DataFrame with observations mapped to CS grids
@@ -69,7 +72,7 @@ def classify_obs_to_cs_grid(
 
     # Cartesian coords of obs
     obs_cart = latlon_to_cartesian(obs_lat, obs_lon)
-    _, neighbor_idxs = kdtree.query(obs_cart, k=k)
+    _, neighbor_idxs = kdtree.query(obs_cart, k=k, workers=workers)
 
     # Create new DataFrame with modified lat/lon and additional 'date'
     obs_super = obs_df.copy()

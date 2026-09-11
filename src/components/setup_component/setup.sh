@@ -253,7 +253,7 @@ setup_imi() {
     if "$CreateAutomaticRectilinearStateVectorFile"; then
         create_statevector
     elif "$RegridStateVector"; then
-        regrid_statevector $StateVectorFile
+        regrid_statevector
     else
         # Copy custom state vector to $RunDirs directory for later use
         printf "\nCopying state vector file\n"
