@@ -312,9 +312,15 @@ create_simulation_dir() {
             -e 's/GFED                   : on    CH4/GFED                   : off    CH4/g' HEMCO_Config.rc
     fi
 
-    # Create run script from template
+    # Create run script from template. Jacobian runs can use the spot
+    # instance template instead of the one copied into template_run.
     if "$UseGCHP"; then
-        sed -e "s:namename:${name}:g" gchp_ch4_run.template >${name}.run
+        if "${UseSpotRunScript:-false}"; then
+            sed -e "s:namename:${name}:g" \
+                ${InversionPath}/src/geoschem_run_scripts/gchp_ch4_run_spot.template >${name}.run
+        else
+            sed -e "s:namename:${name}:g" gchp_ch4_run.template >${name}.run
+        fi
         rm -f gchp_ch4_run.template
     else
         sed -e "s:namename:${name}:g" ch4_run.template >${name}.run
@@ -632,6 +638,9 @@ run_jacobian() {
                     # Create run script from template
                     dir_basename="${dir##*/}"
                     run_template="${InversionPath}/src/geoschem_run_scripts/gchp_ch4_run.template"
+                    if "${UseSpotRunScript:-false}"; then
+                        run_template="${InversionPath}/src/geoschem_run_scripts/gchp_ch4_run_spot.template"
+                    fi
                     sed -e "s:namename:${dir_basename}:g" ${run_template} >${dir_basename}.run
                     chmod 755 ${dir_basename}.run
                     

@@ -1,5 +1,7 @@
 GEOS-Chem
 GCClassic
+GCHP
+configs_*/
 docs/build/
 .DS_STORE
 src/inversion_scripts/__pycache__
@@ -11,3 +13,4 @@ slurm-*.out
 *~
 *.log
 .env
+logs_*/
